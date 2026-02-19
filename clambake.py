@@ -34,6 +34,19 @@ import psycopg2.extras
 
 # --- Configuration -----------------------------------------------------------
 
+# Master switch: set CLAMBAKE_ENABLED=1 to activate, 0 or unset to disable.
+# When disabled, all commands silently exit 0 (no output, no errors).
+# The 'enable', 'disable', and 'init' commands always run regardless.
+CLAMBAKE_ENABLED = os.environ.get("CLAMBAKE_ENABLED", "0") == "1"
+CLAMBAKE_FLAG_FILE = Path(os.environ.get(
+    "CLAMBAKE_FLAG_FILE",
+    Path.home() / ".clambake_enabled"
+))
+
+# Also check flag file (survives shell restarts without .bashrc editing)
+if not CLAMBAKE_ENABLED and CLAMBAKE_FLAG_FILE.exists():
+    CLAMBAKE_ENABLED = CLAMBAKE_FLAG_FILE.read_text().strip() == "1"
+
 DB_HOST = os.environ.get("CLAMBAKE_DB_HOST", "localhost")
 DB_PORT = os.environ.get("CLAMBAKE_DB_PORT", "5433")
 DB_NAME = os.environ.get("CLAMBAKE_DB_NAME", "docdb")
@@ -490,6 +503,36 @@ def cmd_cleanup(args):
         conn.close()
 
 
+def cmd_enable(args):
+    """Enable Clambake coordination."""
+    CLAMBAKE_FLAG_FILE.write_text("1")
+    print("ENABLED: Clambake is now active")
+    print("  Flag file: %s" % CLAMBAKE_FLAG_FILE)
+    print("  Or set env: export CLAMBAKE_ENABLED=1")
+
+
+def cmd_disable(args):
+    """Disable Clambake coordination."""
+    CLAMBAKE_FLAG_FILE.write_text("0")
+    # Also clean up instance registration
+    instance_id, project = get_instance_id()
+    if instance_id:
+        try:
+            conn = get_conn()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM clambake.instances WHERE instance_id = %s",
+                    (instance_id,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        clear_instance_id()
+    print("DISABLED: Clambake is now inactive")
+    print("  All commands will silently no-op until re-enabled")
+    print("  Re-enable with: clambake enable")
+
+
 def cmd_update_memory(args):
     """Update an existing memory entry."""
     conn = get_conn()
@@ -533,6 +576,10 @@ def main():
 
     # init
     sub.add_parser("init", help="Initialize clambake schema in Postgres")
+
+    # enable/disable
+    sub.add_parser("enable", help="Enable Clambake (persists via flag file)")
+    sub.add_parser("disable", help="Disable Clambake (all commands become no-ops)")
 
     # register
     p = sub.add_parser("register", help="Register this instance")
@@ -609,6 +656,8 @@ def main():
 
     commands = {
         "init": cmd_init,
+        "enable": cmd_enable,
+        "disable": cmd_disable,
         "register": cmd_register,
         "heartbeat": cmd_heartbeat,
         "status": cmd_status,
@@ -622,6 +671,13 @@ def main():
         "deregister": cmd_deregister,
         "cleanup": cmd_cleanup,
     }
+
+    # Commands that always run regardless of enabled state
+    ALWAYS_RUN = {"init", "enable", "disable"}
+
+    # Gate check: if disabled, silently exit for non-essential commands
+    if not CLAMBAKE_ENABLED and args.command not in ALWAYS_RUN:
+        sys.exit(0)
 
     try:
         commands[args.command](args)

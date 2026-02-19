@@ -9,7 +9,20 @@ Clambake is a lightweight coordination system for multiple Claude Code instances
 - **Schema**: `clambake` (separate from Doc DB's `public` schema)
 - **Requires**: `psycopg2` (already installed in Doc DB v2 container; install locally with `pip install psycopg2-binary`)
 
-## Session Protocol — FOLLOW THIS
+## Enable/Disable (Opt-In System)
+
+Clambake is **opt-in**. When disabled, all commands silently exit 0 — no output, no errors. CLAUDE.md instructions that call clambake won't break anything.
+
+```bash
+python F:/Docker/clambake/clambake.py enable     # Turn on (persists via ~/.clambake_enabled)
+python F:/Docker/clambake/clambake.py disable    # Turn off (all commands become silent no-ops)
+```
+
+Or via environment variable: `export CLAMBAKE_ENABLED=1`
+
+The `init`, `enable`, and `disable` commands always run regardless of flag state.
+
+## Session Protocol — FOLLOW THIS (when enabled)
 
 ### On Session Start (MANDATORY)
 ```bash
@@ -55,6 +68,8 @@ python F:/Docker/clambake/clambake.py deregister
 ## CLI Quick Reference
 | Command | Purpose |
 |---------|---------|
+| `enable` | Turn on Clambake (persists via flag file) |
+| `disable` | Turn off (all commands become silent no-ops) |
 | `register --project X` | Join the coordination system |
 | `heartbeat --task "..."` | Update what you're working on |
 | `status` | See all active instances and recent activity |
