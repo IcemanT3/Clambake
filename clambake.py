@@ -577,9 +577,11 @@ def main():
     # init
     sub.add_parser("init", help="Initialize clambake schema in Postgres")
 
-    # enable/disable
+    # enable/disable (both long and short forms)
     sub.add_parser("enable", help="Enable Clambake (persists via flag file)")
+    sub.add_parser("on", help="Enable Clambake (alias for enable)")
     sub.add_parser("disable", help="Disable Clambake (all commands become no-ops)")
+    sub.add_parser("off", help="Disable Clambake (alias for disable)")
 
     # register
     p = sub.add_parser("register", help="Register this instance")
@@ -657,7 +659,9 @@ def main():
     commands = {
         "init": cmd_init,
         "enable": cmd_enable,
+        "on": cmd_enable,
         "disable": cmd_disable,
+        "off": cmd_disable,
         "register": cmd_register,
         "heartbeat": cmd_heartbeat,
         "status": cmd_status,
@@ -673,7 +677,7 @@ def main():
     }
 
     # Commands that always run regardless of enabled state
-    ALWAYS_RUN = {"init", "enable", "disable"}
+    ALWAYS_RUN = {"init", "enable", "on", "disable", "off"}
 
     # Gate check: if disabled, silently exit for non-essential commands
     if not CLAMBAKE_ENABLED and args.command not in ALWAYS_RUN:
