@@ -533,6 +533,350 @@ def cmd_disable(args):
     print("  Re-enable with: clambake enable")
 
 
+def cmd_role_list(args):
+    """List all agent roles."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT name, description, capabilities FROM clambake.agent_roles ORDER BY name")
+            roles = cur.fetchall()
+            if not roles:
+                print("ROLES: none defined. Run 'clambake role seed' to create defaults.")
+                return
+            print("=== AGENT ROLES ===")
+            for r in roles:
+                caps = ", ".join(r["capabilities"] or [])
+                print("  [%s] %s  (%s)" % (r["name"], r["description"], caps))
+    finally:
+        conn.close()
+
+
+def cmd_role_get(args):
+    """Get full details of an agent role including system prompt."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM clambake.agent_roles WHERE name = %s", (args.name,))
+            r = cur.fetchone()
+            if not r:
+                print("ERROR: Role '%s' not found" % args.name)
+                sys.exit(1)
+            print("ROLE: %s" % r["name"])
+            print("  Description: %s" % r["description"])
+            print("  Capabilities: %s" % ", ".join(r["capabilities"] or []))
+            print("  System Prompt:\n%s" % r["system_prompt"])
+    finally:
+        conn.close()
+
+
+def cmd_role_create(args):
+    """Create or update an agent role."""
+    caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else []
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO clambake.agent_roles (name, description, system_prompt, capabilities)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (name) DO UPDATE SET
+                    description = EXCLUDED.description,
+                    system_prompt = EXCLUDED.system_prompt,
+                    capabilities = EXCLUDED.capabilities,
+                    updated_at = NOW()
+            """, (args.name, args.description, args.prompt, caps))
+        conn.commit()
+        print("ROLE: '%s' saved" % args.name)
+    finally:
+        conn.close()
+
+
+def cmd_role_seed(args):
+    """Seed the four default agent roles."""
+    roles = [
+        {
+            "name": "planner",
+            "description": "Reads codebase, designs architecture, writes specs. Does not code.",
+            "system_prompt": (
+                "You are the Planner. Your job is to read the codebase, understand the architecture, "
+                "and write detailed implementation specs for other agents.\n\n"
+                "RULES:\n"
+                "- Read and analyze code extensively before writing a spec\n"
+                "- Break large tasks into discrete, non-overlapping subtasks\n"
+                "- Each subtask should specify: files to create/modify, expected behavior, acceptance criteria\n"
+                "- Assign a file_scope to each subtask so agents don't conflict\n"
+                "- DO NOT write code — only specs and plans\n"
+                "- Use 'clambake task create' to dispatch subtasks when your plan is ready\n"
+                "- Use 'clambake remember' to store architecture decisions"
+            ),
+            "capabilities": ["read_code", "write_specs", "create_tasks"]
+        },
+        {
+            "name": "coder",
+            "description": "Implements features and fixes bugs according to specs. Does not test.",
+            "system_prompt": (
+                "You are the Coder. You implement code according to the spec in your task description.\n\n"
+                "RULES:\n"
+                "- Read the task description carefully — it is your spec\n"
+                "- Only modify files listed in your task's file_scope\n"
+                "- Write clean, working code that meets the acceptance criteria\n"
+                "- DO NOT write tests — QA handles that\n"
+                "- DO NOT refactor code outside your scope\n"
+                "- When done, run 'clambake task done <id>' with a summary of what you built\n"
+                "- If blocked, run 'clambake task fail <id> --result \"reason\"' and it will be reassigned"
+            ),
+            "capabilities": ["write_code", "read_code"]
+        },
+        {
+            "name": "qa",
+            "description": "Writes tests, runs them, finds bugs. Reports issues but does not fix them.",
+            "system_prompt": (
+                "You are QA. You test code that other agents have written.\n\n"
+                "RULES:\n"
+                "- Read the original task spec to understand expected behavior\n"
+                "- Write tests that verify the acceptance criteria\n"
+                "- Run the tests and report results\n"
+                "- If you find bugs, use 'clambake task create' to file a bug fix task for the coder\n"
+                "- DO NOT fix bugs yourself — report them\n"
+                "- When all tests pass, run 'clambake task done <id>' with test results\n"
+                "- Use 'clambake send' to notify the coder of any issues found"
+            ),
+            "capabilities": ["read_code", "write_tests", "run_tests", "create_tasks"]
+        },
+        {
+            "name": "reviewer",
+            "description": "Reviews code for quality, security, and patterns. Approves or rejects.",
+            "system_prompt": (
+                "You are the Reviewer. You review code changes for quality and correctness.\n\n"
+                "RULES:\n"
+                "- Read the task spec and the code that was written\n"
+                "- Check for: correctness, security issues, code quality, adherence to patterns\n"
+                "- If approved, run 'clambake task done <id>' with your review notes\n"
+                "- If rejected, run 'clambake task fail <id>' with specific feedback\n"
+                "- DO NOT modify code yourself — only review and provide feedback\n"
+                "- Use 'clambake remember' to document patterns you want enforced"
+            ),
+            "capabilities": ["read_code", "review"]
+        }
+    ]
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            for r in roles:
+                cur.execute("""
+                    INSERT INTO clambake.agent_roles (name, description, system_prompt, capabilities)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (name) DO UPDATE SET
+                        description = EXCLUDED.description,
+                        system_prompt = EXCLUDED.system_prompt,
+                        capabilities = EXCLUDED.capabilities,
+                        updated_at = NOW()
+                """, (r["name"], r["description"], r["system_prompt"], r["capabilities"]))
+        conn.commit()
+        print("SEEDED: %d agent roles (planner, coder, qa, reviewer)" % len(roles))
+    finally:
+        conn.close()
+
+
+def cmd_task_create(args):
+    """Create a new task."""
+    instance_id, _ = get_instance_id()
+    created_by = instance_id or "human"
+    depends = [int(x.strip()) for x in args.depends_on.split(",")] if args.depends_on else []
+    files = [f.strip() for f in args.file_scope.split(",")] if args.file_scope else []
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO clambake.tasks
+                    (title, description, project, priority, assigned_role,
+                     file_scope, depends_on, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (args.title, args.description, args.project, args.priority,
+                  args.role, files, depends, created_by))
+            task_id = cur.fetchone()[0]
+        conn.commit()
+        role_str = " [%s]" % args.role if args.role else ""
+        print("TASK #%d: %s%s — %s" % (task_id, args.project, role_str, args.title))
+    finally:
+        conn.close()
+
+
+def cmd_task_list(args):
+    """List tasks, optionally filtered."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            query = "SELECT * FROM clambake.tasks WHERE TRUE"
+            params = []
+            if args.project:
+                query += " AND project = %s"
+                params.append(args.project)
+            if args.status:
+                query += " AND status = %s"
+                params.append(args.status)
+            if args.role:
+                query += " AND assigned_role = %s"
+                params.append(args.role)
+            if args.available:
+                query = "SELECT * FROM clambake.available_tasks WHERE TRUE"
+                params = []
+                if args.project:
+                    query += " AND project = %s"
+                    params.append(args.project)
+                if args.role:
+                    query += " AND assigned_role = %s"
+                    params.append(args.role)
+            else:
+                query += " ORDER BY priority DESC, created_at ASC"
+            cur.execute(query, params)
+            tasks = cur.fetchall()
+
+            if not tasks:
+                print("TASKS: none found")
+                return
+
+            print("=== TASKS (%d) ===" % len(tasks))
+            for t in tasks:
+                role = t["assigned_role"] or "any"
+                inst = t["assigned_instance"][:8] if t["assigned_instance"] else "-"
+                deps = ",".join(str(d) for d in (t["depends_on"] or []))
+                deps_str = " deps:[%s]" % deps if deps else ""
+                print("  #%d [%s] %s (%s) -> %s%s — %s" % (
+                    t["id"], t["status"], t["project"], role, inst,
+                    deps_str, t["title"]))
+    finally:
+        conn.close()
+
+
+def cmd_task_claim(args):
+    """Claim a pending task for the current instance."""
+    instance_id, project = get_instance_id()
+    if not instance_id:
+        print("ERROR: Not registered.")
+        sys.exit(1)
+
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Atomically claim: only if still pending
+            cur.execute("""
+                UPDATE clambake.tasks
+                SET status = 'claimed',
+                    assigned_instance = %s,
+                    claimed_at = NOW()
+                WHERE id = %s AND status = 'pending'
+                RETURNING id, title, assigned_role, description, file_scope
+            """, (instance_id, args.task_id))
+            task = cur.fetchone()
+            if not task:
+                print("ERROR: Task #%s not available (already claimed or doesn't exist)" % args.task_id)
+                sys.exit(1)
+        conn.commit()
+
+        print("CLAIMED: #%d — %s" % (task["id"], task["title"]))
+        if task["assigned_role"]:
+            # Fetch the role's system prompt
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT system_prompt FROM clambake.agent_roles WHERE name = %s",
+                            (task["assigned_role"],))
+                role = cur.fetchone()
+                if role:
+                    print("\n=== ROLE: %s ===" % task["assigned_role"])
+                    print(role["system_prompt"])
+        if task["description"]:
+            print("\n=== SPEC ===")
+            print(task["description"])
+        if task["file_scope"]:
+            print("\n=== FILE SCOPE ===")
+            for f in task["file_scope"]:
+                print("  %s" % f)
+
+        # Update instance current_task
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE clambake.instances
+                SET current_task = %s, status = 'busy', last_heartbeat = NOW()
+                WHERE instance_id = %s
+            """, (task["title"], instance_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def cmd_task_done(args):
+    """Mark a task as completed."""
+    instance_id, _ = get_instance_id()
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE clambake.tasks
+                SET status = 'done', result = %s, completed_at = NOW()
+                WHERE id = %s AND assigned_instance = %s
+                RETURNING id
+            """, (args.result, args.task_id, instance_id))
+            if cur.rowcount == 0:
+                # Allow without instance check (for human/admin)
+                cur.execute("""
+                    UPDATE clambake.tasks
+                    SET status = 'done', result = %s, completed_at = NOW()
+                    WHERE id = %s
+                    RETURNING id
+                """, (args.result, args.task_id))
+                if cur.rowcount == 0:
+                    print("ERROR: Task #%s not found" % args.task_id)
+                    sys.exit(1)
+        conn.commit()
+
+        # Clear instance current_task
+        if instance_id:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE clambake.instances
+                    SET current_task = NULL, status = 'active', last_heartbeat = NOW()
+                    WHERE instance_id = %s
+                """, (instance_id,))
+            conn.commit()
+        print("DONE: Task #%s completed" % args.task_id)
+    finally:
+        conn.close()
+
+
+def cmd_task_fail(args):
+    """Mark a task as failed."""
+    instance_id, _ = get_instance_id()
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE clambake.tasks
+                SET status = 'failed', result = %s, completed_at = NOW()
+                WHERE id = %s
+                RETURNING id
+            """, (args.result, args.task_id))
+            if cur.rowcount == 0:
+                print("ERROR: Task #%s not found" % args.task_id)
+                sys.exit(1)
+        conn.commit()
+
+        if instance_id:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE clambake.instances
+                    SET current_task = NULL, status = 'active', last_heartbeat = NOW()
+                    WHERE instance_id = %s
+                """, (instance_id,))
+            conn.commit()
+        print("FAILED: Task #%s — %s" % (args.task_id, args.result or "no reason given"))
+    finally:
+        conn.close()
+
+
 def cmd_update_memory(args):
     """Update an existing memory entry."""
     conn = get_conn()
@@ -648,6 +992,58 @@ def main():
     p.add_argument("--summary", required=True)
     p.add_argument("--files", help="Comma-separated modified files")
 
+    # --- Task dispatch commands ---
+
+    # task create
+    p = sub.add_parser("task-create", help="Create a task")
+    p.add_argument("--title", required=True)
+    p.add_argument("--project", required=True)
+    p.add_argument("--description")
+    p.add_argument("--role", help="Assigned agent role (coder, qa, reviewer, planner)")
+    p.add_argument("--priority", type=int, default=0)
+    p.add_argument("--file-scope", dest="file_scope", help="Comma-separated files this task owns")
+    p.add_argument("--depends-on", dest="depends_on", help="Comma-separated task IDs")
+
+    # task list
+    p = sub.add_parser("task-list", help="List tasks")
+    p.add_argument("--project")
+    p.add_argument("--status", choices=["pending", "claimed", "in_progress", "done", "failed"])
+    p.add_argument("--role")
+    p.add_argument("--available", action="store_true", help="Only show claimable tasks")
+
+    # task claim
+    p = sub.add_parser("task-claim", help="Claim a task")
+    p.add_argument("task_id", type=int)
+
+    # task done
+    p = sub.add_parser("task-done", help="Mark task completed")
+    p.add_argument("task_id", type=int)
+    p.add_argument("--result", help="Summary of what was done")
+
+    # task fail
+    p = sub.add_parser("task-fail", help="Mark task failed")
+    p.add_argument("task_id", type=int)
+    p.add_argument("--result", help="Reason for failure")
+
+    # --- Agent role commands ---
+
+    # role list
+    sub.add_parser("role-list", help="List all agent roles")
+
+    # role get
+    p = sub.add_parser("role-get", help="Get role details + system prompt")
+    p.add_argument("name")
+
+    # role create
+    p = sub.add_parser("role-create", help="Create/update an agent role")
+    p.add_argument("--name", required=True)
+    p.add_argument("--description", required=True)
+    p.add_argument("--prompt", required=True, help="System prompt for this role")
+    p.add_argument("--capabilities", help="Comma-separated capabilities")
+
+    # role seed
+    sub.add_parser("role-seed", help="Seed default roles (planner, coder, qa, reviewer)")
+
     # deregister
     sub.add_parser("deregister", help="Unregister this instance")
 
@@ -672,6 +1068,15 @@ def main():
         "recall": cmd_recall,
         "update-memory": cmd_update_memory,
         "log": cmd_log,
+        "task-create": cmd_task_create,
+        "task-list": cmd_task_list,
+        "task-claim": cmd_task_claim,
+        "task-done": cmd_task_done,
+        "task-fail": cmd_task_fail,
+        "role-list": cmd_role_list,
+        "role-get": cmd_role_get,
+        "role-create": cmd_role_create,
+        "role-seed": cmd_role_seed,
         "deregister": cmd_deregister,
         "cleanup": cmd_cleanup,
     }

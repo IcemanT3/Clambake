@@ -1,0 +1,26 @@
+services:
+  orchestrator:
+    build: .
+    container_name: clambake-orchestrator
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      # Clambake connects to Postgres as superuser (for task dispatch)
+      CLAMBAKE_DB_HOST: host.docker.internal
+      CLAMBAKE_DB_PORT: "5433"
+      CLAMBAKE_DB_NAME: docdb
+      CLAMBAKE_DB_USER: postgres
+      CLAMBAKE_DB_PASS: postgres
+      # Agents use restricted user for mindmeld work
+      MINDMELD_DB_HOST: host.docker.internal
+      MINDMELD_DB_PORT: "5433"
+      MINDMELD_DB_NAME: mindmeld
+      MINDMELD_DB_USER: mindmeld_agent
+      MINDMELD_DB_PASS: mindmeld_agent
+      # Ollama for embeddings
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+    volumes:
+      - "F:/Claude App/Mind Meld:/workspace"
+      - "F:/Docker/clambake:/opt/clambake"
+    restart: unless-stopped
+    stdin_open: true
+    tty: true

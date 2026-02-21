@@ -181,6 +181,62 @@ WHERE created_at > NOW() - INTERVAL '7 days'
 ORDER BY created_at DESC;
 
 -- ============================================================
+-- 6. AGENT_ROLES — Specialized agent definitions (stored in DB, not CLAUDE.md)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS clambake.agent_roles (
+    id              SERIAL PRIMARY KEY,
+    name            TEXT UNIQUE NOT NULL,           -- e.g. 'coder', 'qa', 'reviewer', 'planner'
+    description     TEXT NOT NULL,                  -- short description of what this role does
+    system_prompt   TEXT NOT NULL,                  -- the full system prompt / CLAUDE.md content
+    capabilities    TEXT[] DEFAULT '{}',            -- e.g. '{write_code, run_tests, review}'
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================
+-- 7. TASKS — Dispatchable work items for multi-agent orchestration
+-- ============================================================
+CREATE TABLE IF NOT EXISTS clambake.tasks (
+    id              SERIAL PRIMARY KEY,
+    title           TEXT NOT NULL,
+    description     TEXT,                           -- detailed spec / requirements
+    project         TEXT NOT NULL,                  -- e.g. 'mindmeld'
+    priority        INT NOT NULL DEFAULT 0,         -- higher = more important
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'claimed', 'in_progress', 'done', 'failed')),
+    assigned_role   TEXT REFERENCES clambake.agent_roles(name),  -- which role should do this
+    assigned_instance TEXT,                         -- instance_id that claimed it
+    file_scope      TEXT[] DEFAULT '{}',            -- files this task owns (non-overlapping)
+    depends_on      INT[] DEFAULT '{}',             -- task IDs that must complete first
+    result          TEXT,                           -- output/notes when done or failure reason
+    created_by      TEXT NOT NULL DEFAULT 'human',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status
+    ON clambake.tasks (status) WHERE status IN ('pending', 'claimed', 'in_progress');
+
+CREATE INDEX IF NOT EXISTS idx_tasks_project
+    ON clambake.tasks (project, status);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_assigned
+    ON clambake.tasks (assigned_instance) WHERE assigned_instance IS NOT NULL;
+
+-- View: available tasks (pending, dependencies met)
+CREATE OR REPLACE VIEW clambake.available_tasks AS
+SELECT t.*
+FROM clambake.tasks t
+WHERE t.status = 'pending'
+  AND NOT EXISTS (
+    SELECT 1 FROM unnest(t.depends_on) AS dep_id
+    JOIN clambake.tasks d ON d.id = dep_id
+    WHERE d.status NOT IN ('done')
+  )
+ORDER BY t.priority DESC, t.created_at ASC;
+
+-- ============================================================
 -- CLEANUP FUNCTION — Remove stale data
 -- ============================================================
 CREATE OR REPLACE FUNCTION clambake.cleanup() RETURNS void AS $$
