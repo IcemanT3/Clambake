@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y \
 RUN npm install -g @anthropic-ai/claude-code
 
 # Python deps for clambake
-RUN pip3 install --break-system-packages psycopg2-binary
+RUN pip3 install --break-system-packages psycopg2-binary requests
 
 # Create non-root user (Claude blocks --dangerously-skip-permissions as root)
 RUN useradd -m -s /bin/bash agent && \

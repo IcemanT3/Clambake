@@ -441,6 +441,271 @@ def migrate(conn):
     print("Run 'python clambake.py recall --project doc-db-v2' to verify.")
 
 
+def migrate_memory_files(conn):
+    """Migrate unique content from all 7 auto-memory MEMORY.md files into Clambake Postgres.
+
+    Content disposition (per plan):
+    - C--Users-test/: Port registry, MCP config, API keys -> global_memory
+    - C--Users-test--local-bin/: User profile -> global; Swarm issues -> project; Docker rebuild -> global
+    - C--Users-test-OneDrive-Tridents/: User prefs -> global; wslrelay fix -> global; SSD/HDD rule -> global
+    - F--/: JMAP gotchas -> already in stalwart-mail CLAUDE.md (skip); Ollama model path -> global
+    - F--Jarus/: Self-contained -> project_memory (jarus)
+    - F--NotebookLM/: Self-contained -> project_memory (notebooklm-connector)
+    - F--Docker/: vLLM notes -> project_memory (vllm, status=deprecated)
+    """
+    cur = conn.cursor()
+    count = 0
+
+    # ========================================================================
+    # 1. C--Users-test/ (Port registry, MCP config, API keys, Traefik, active projects)
+    # ========================================================================
+    print("Migrating C--Users-test/ MEMORY.md...")
+
+    insert_global(cur, "infrastructure", "Port registry",
+        "Key ports in use:\n"
+        "53: CoreDNS (Docker, wildcard *.docker.lan -> 127.0.0.1)\n"
+        "80: Traefik reverse proxy (Docker, routes *.docker.lan)\n"
+        "3001: Open WebUI (Docker)\n"
+        "3002: Paperless-AI (Docker)\n"
+        "5433: PostgreSQL + pgvector (Docker, swarm-postgres)\n"
+        "7860: Qwen3 TTS Gradio UI (Docker)\n"
+        "8000: vLLM/Qwen3 TTS API (shared port)\n"
+        "8002: Paperless-ngx (Docker)\n"
+        "8080: Traefik Dashboard (Docker)\n"
+        "8090: Stalwart Mail HTTP (Docker)\n"
+        "8443: Stalwart Mail HTTPS (Docker)\n"
+        "8501: Doc DB v2 (Docker)\n"
+        "11434: Ollama (local)\n"
+        "Full registry: F:/Docker/ports.md",
+        ["ports", "networking"])
+    count += 1
+
+    insert_global(cur, "credential", "Claude Desktop MCP config",
+        "Config file: C:/Users/test/AppData/Roaming/Claude/claude_desktop_config.json\n"
+        "Configured servers: openai, filesystem, docdb",
+        ["mcp", "claude-desktop"])
+    count += 1
+
+    insert_global(cur, "credential", "API key locations",
+        "Anthropic API key: F:/Claude App/Swarm Orchestration/.env and F:/Docker/clambake/.env\n"
+        "GitHub token: gh auth token\n"
+        "OpenRouter API key: F:/Docker/doc-db-v2/.env\n"
+        "OpenAI key: Claude Desktop config (MCP openai server)",
+        ["api-keys"])
+    count += 1
+
+    insert_global(cur, "infrastructure", "Traefik reverse proxy setup",
+        "CoreDNS (F:/Docker/coredns/) resolves all *.docker.lan to 127.0.0.1\n"
+        "Traefik (F:/Docker/traefik/) on port 80 routes by hostname to containers\n"
+        "Shared 'proxy' Docker network connects Traefik to services\n"
+        "Services opt in via labels: traefik.enable=true + router rule + service port\n"
+        "Hostnames: open-webui.docker.lan, doc-db-v2.docker.lan, qwen3-tts.docker.lan, "
+        "traefik.docker.lan, mail.docker.lan\n"
+        "Traefik v3.3 had Docker API issues; v3.6+ works with Docker Desktop 4.60+",
+        ["traefik", "networking", "coredns"])
+    count += 1
+
+    # ========================================================================
+    # 2. C--Users-test--local-bin/ (User profile, Swarm, Docker rebuild)
+    # ========================================================================
+    print("Migrating C--Users-test--local-bin/ MEMORY.md...")
+
+    insert_global(cur, "preference", "User profile",
+        "Non-developer user working in litigation. Has F: drive with project folders at F:\\Claude App\\. "
+        "Uses OpenRouter for multi-model access. Has Docker Desktop on Windows with containers. "
+        "Prefers direct, practical solutions.",
+        ["user-profile"])
+    count += 1
+
+    insert_project(cur, "swarm-orchestration", "issue", "Issue #13: API key not reaching interactive Claude sessions",
+        "Root cause: source /home/ubuntu/.env_claude inside nested tmux->runuser->bash-c quoting chain silently fails.\n"
+        "Debug proof: debug log shows 'Could not resolve authentication method' — ANTHROPIC_API_KEY is empty.\n"
+        "Why -p mode works: Single bash -c with no tmux quoting layer -> source works.\n"
+        "FIX NEEDED: Patch tmux.ts to pass ANTHROPIC_API_KEY via env parameter instead of sourcing file.\n"
+        "The env dict { OVERSTORY_AGENT_NAME: name } gets converted to export KEY=value — add API key there.",
+        ["api-key", "tmux", "blocking"])
+    count += 1
+
+    insert_project(cur, "swarm-orchestration", "issue", "Issue #14: Missing agent definition files",
+        "overstory init creates: coder, coordinator, designer, lead, merger, planner, qa. "
+        "But agent-manifest.json expects: scout, builder, reviewer, supervisor, monitor. "
+        "Fix: copy existing .md files (e.g., cp coder.md builder.md) — already done.",
+        ["agents", "manifest"])
+    count += 1
+
+    insert_project(cur, "swarm-orchestration", "pattern", "Swarm orchestration key patterns",
+        "//bin//bash in docker exec from Git Bash prevents Windows path mangling.\n"
+        "Clean PATH: export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.bun/bin\n"
+        "TMUX_TMPDIR=/tmp/overstory-tmux for cross-user tmux socket access.\n"
+        "Coordinator/Lead agents are read-only -> spawn coders with --force-hierarchy.\n"
+        "One-click scripts: start-swarm.sh, setup.sh, patch-tmux.py, patch-sling.py, dashboard.sh",
+        ["tmux", "docker", "scripts"])
+    count += 1
+
+    insert_global(cur, "infrastructure", "Docker Desktop rebuild (2026-02-21)",
+        "VHDX lost during C:->F: migration — all container state gone, rebuilt from scratch.\n"
+        "VHDX IS ON WRONG DRIVE — Docker rebuilt on C: despite config pointing to F:.\n"
+        "Post-reboot: must export/reimport WSL distro to F:\\Docker\\data\\wsl\\.\n"
+        "8 containers running: postgres, coredns, traefik, stalwart-mail, doc-db-v2, open-webui, clambake, qwen3-tts.\n"
+        "Postgres is Docker container (port 5433) with databases: docdb, mindmeld.\n"
+        "Ollama is local Windows app (port 11434), not Docker.",
+        ["docker", "vhdx", "rebuild"])
+    count += 1
+
+    # ========================================================================
+    # 3. C--Users-test-OneDrive-Tridents/ (Prefs, wslrelay, SSD/HDD rule)
+    # ========================================================================
+    print("Migrating C--Users-test-OneDrive-Tridents/ MEMORY.md...")
+
+    insert_global(cur, "preference", "Communication preferences",
+        "Explain what you're about to do and why BEFORE doing it.\n"
+        "Check in before making architectural decisions — don't just build.\n"
+        "User is learning the system; treat changes as a teaching moment.\n"
+        "Don't run ahead with multiple changes without confirming direction first.\n"
+        "Only implement infrastructure that Claude Code can manage via CLI, MCP, API, or Playwright — no manual portal clicking.\n"
+        "Cloudflare preferred over Azure portals for this reason.",
+        ["communication", "workflow"])
+    count += 1
+
+    insert_global(cur, "tool", "wslrelay.exe can zombie on Windows Docker Desktop",
+        "wslrelay.exe can zombie on Windows Docker Desktop — check with netstat and kill.\n"
+        "Python is NOT available on the Windows host — only inside Docker containers.\n"
+        "MSYS_NO_PATHCONV=1 required for docker exec paths in Git Bash.",
+        ["wslrelay", "windows", "docker"])
+    count += 1
+
+    insert_global(cur, "infrastructure", "Drive performance rule: SSD vs HDD",
+        "F: is mechanical HDD (WD 8TB), C: is SSD (Crucial 2TB) — explains slow transfers.\n"
+        "Performance rule: disk-heavy apps (Postgres, Doc DB, Ollama) on C: SSD; "
+        "API-bound workloads (Clambake agents) on F: HDD is fine.\n"
+        "F: drive has ~6 TB free — use for heavy storage.\n"
+        "Ollama models (51 GB) copied to F:/Ollama/models/ — need symlink setup.",
+        ["ssd", "hdd", "performance", "storage"])
+    count += 1
+
+    # Mindmeld pipeline status from this file
+    insert_project(cur, "mindmeld", "update", "Mindmeld pipeline status (built by Haiku agents)",
+        "Tasks #1-7 DONE: Schema, .jsonl parser, classifier, embedder, RAG query, bulk ingest, QA testing.\n"
+        "Task #8 IN PROGRESS: Parser JSONL bug fix (interrupted by Docker crash).\n"
+        "Task #9 PENDING: Code review of all modules.\n"
+        "Known issues: Embedding dim mismatch (schema says vector(1536), nomic-embed-text produces 768). "
+        "Some files in /workspace/ root instead of /workspace/ingest/. "
+        "QA said 'production ready' but tested synthetic data, not real transcripts.",
+        ["pipeline", "agents", "status"])
+    count += 1
+
+    insert_project(cur, "mindmeld", "architecture", "Mindmeld project overview",
+        "Corporate memory platform — ingests transcripts, emails, Claude sessions into Postgres.\n"
+        "Database: localhost:5433, mindmeld database, mindmeld_agent/mindmeld_agent.\n"
+        "Schema fully deployed, 0 data ingested.\n"
+        "Project files: F:/Claude App/Mind Meld/ (schema, scripts, parsers).\n"
+        "Build plan: F:/Claude App/Mind Meld/BUILD.md.",
+        ["architecture", "postgres"])
+    count += 1
+
+    # ========================================================================
+    # 4. F--/ (Ollama model path — JMAP gotchas skip, already in stalwart-mail)
+    # ========================================================================
+    print("Migrating F--/ MEMORY.md (Ollama path only, JMAP already covered)...")
+
+    insert_global(cur, "infrastructure", "Ollama local setup and models",
+        "Installed locally (not Docker): C:/Users/test/AppData/Local/Programs/Ollama/ollama\n"
+        "Models stored on F drive: OLLAMA_MODELS=F:\\ollama\\models\n"
+        "Models: nomic-embed-text (embeddings, 768-dim), minicpm-v (OCR), qwen3:8b (classification)\n"
+        "Must be running for embeddings — start with 'ollama serve' if not running.\n"
+        "Open WebUI (Docker, port 3001) is a frontend overlay for local Ollama.",
+        ["ollama", "models", "embeddings"])
+    count += 1
+
+    insert_global(cur, "preference", "Build preferences",
+        "Prefers zero-shot implementation when possible (build all phases at once).\n"
+        "Wants build time vs debug time tracked.\n"
+        "Prioritizes working features over perfect code.\n"
+        "User sets priorities — don't go off on tangents.\n"
+        "Update CLAUDE.md, ISSUES.md, MEMORY.md files after significant work.",
+        ["workflow", "preferences"])
+    count += 1
+
+    # ========================================================================
+    # 5. F--Jarus/ -> project_memory (jarus)
+    # ========================================================================
+    print("Migrating F--Jarus/ MEMORY.md -> jarus project...")
+
+    insert_project(cur, "jarus", "architecture", "Jarus Integrator project overview",
+        "Integration middleware connecting JARUS DXP to external SaaS for American Patriot Exchange (Apex).\n"
+        "Originally planned to build custom engines from scratch; JARUS already provides 17 modules.\n"
+        "Scope: configure JARUS (no-code) + build integration connectors (custom code).\n"
+        "Architecture: JARUS DXP -> JARUS REST APIs/ACORD XML -> Integration Layer (custom) -> External SaaS.\n"
+        "Effort: 40% JARUS config, 35% connectors, 15% sync engine, 10% testing.\n"
+        "Company: American Patriot Exchange (Apex), FL homeowners only, HCI 9.99% ownership.",
+        ["apex", "jarus", "insurance"],
+        ["Jarus Technical Blueprint.md", "Apex Carrier Objectives.md"])
+    count += 1
+
+    insert_project(cur, "jarus", "decision", "Key Jarus decisions",
+        "Maria Moller is the ultimate decision maker — her directives override all others.\n"
+        "Rate changes done in JARUS Product Configurator (not Excel). Excel only for one-time migration.\n"
+        "JARUS is system of record for policies. External tools get synced data.\n"
+        "AAIS Homeowners template is the starting base product in JARUS.",
+        ["decisions", "maria"])
+    count += 1
+
+    insert_project(cur, "jarus", "pattern", "Transcript processing workflow",
+        "When new transcript added:\n"
+        "1. Rename to YYYY-MM-DD - [Meeting Title] - Read.ai Transcript.txt in Transcripts/\n"
+        "2. Read full transcript, filter out noise (weather, stocks, other clients)\n"
+        "3. Extract decisions, modules, technical details, vendor choices, timelines\n"
+        "4. Date-stamp everything — track what changed between meetings\n"
+        "5. Maria's word is final — overrides Brandon, Greg, Sundar\n"
+        "6. Update Apex Carrier Objectives.md\n"
+        "3 transcripts processed: 2026-01-14, 2026-01-28, 2026-02-06",
+        ["transcripts", "workflow"])
+    count += 1
+
+    # ========================================================================
+    # 6. F--NotebookLM/ -> project_memory (notebooklm-connector)
+    # ========================================================================
+    print("Migrating F--NotebookLM/ MEMORY.md -> notebooklm-connector project...")
+
+    insert_project(cur, "notebooklm-connector", "architecture", "NotebookLM Connector setup",
+        "MCP CLI tool (notebooklm-mcp-cli v0.2.22 via uv) for Claude Code.\n"
+        "Auth: postingcomputers@gmail.com, 115+ notebooks.\n"
+        "Active notebook: Claude Code — Project Knowledge Base (16ade1ec-0ebe-4516-8350-e783082204ef).\n"
+        "Windows workarounds: PYTHONIOENCODING=utf-8 for nlm CLI, close Chrome before nlm login, "
+        "sessions expire ~20 min.\n"
+        "Chat interface: chat.pyw (Gradio), Launch Chat.vbs (no console), "
+        "default notebook: Arbitration for Employment (d1c063fe).",
+        ["notebooklm", "mcp", "gradio"],
+        ["chat.pyw", "Launch Chat.vbs"])
+    count += 1
+
+    insert_project(cur, "notebooklm-connector", "gotcha", "pythonw + Gradio/uvicorn crashes",
+        "Must patch sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__ (all are None under pythonw). "
+        "uvicorn's logging calls .isatty() on sys.__stdout__ and crashes otherwise. "
+        "Also use os.startfile() not webbrowser.open() for opening browser from pythonw.",
+        ["pythonw", "gradio", "uvicorn"])
+    count += 1
+
+    # ========================================================================
+    # 7. F--Docker/ -> project_memory (vllm, deprecated)
+    # ========================================================================
+    print("Migrating F--Docker/ MEMORY.md -> vllm project (deprecated)...")
+
+    insert_project(cur, "vllm", "issue", "vLLM Docker deployment blocked by WSL GPU init",
+        "vllm/vllm-openai:latest image with pre-configured entrypoint.\n"
+        "Must pass flags: --model <model> --host 0.0.0.0 --port 8000.\n"
+        "BLOCKER: API server process hangs during GPU model loading.\n"
+        "Logs freeze at: 'Using FLASH_ATTN attention backend'.\n"
+        "Port 8000 never becomes listening despite GPU memory allocation.\n"
+        "WSL Compatibility: pin_memory=False warning, possible CUDA deadlock.\n"
+        "May need: --enforce-eager, disable cudagraph, or CPU mode.",
+        ["vllm", "gpu", "wsl", "blocked"])
+    count += 1
+
+    conn.commit()
+    print("\nMigrated %d memory-file entries into Clambake." % count)
+
+
 if __name__ == "__main__":
     conn = get_conn()
     try:
@@ -454,16 +719,36 @@ if __name__ == "__main__":
             print("ERROR: Clambake schema not found. Run 'python clambake.py init' first.")
             sys.exit(1)
 
-        # Check if already migrated
+        # Check existing migration counts
         cur.execute("SELECT COUNT(*) FROM clambake.project_memory WHERE created_by = 'migration'")
-        existing = cur.fetchone()[0]
-        if existing > 0:
-            print("WARNING: Found %d existing migration entries." % existing)
-            resp = input("Re-run migration? This will add duplicates. (y/N): ")
-            if resp.lower() != 'y':
-                print("Aborted.")
-                sys.exit(0)
+        proj_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM clambake.global_memory WHERE created_by = 'migration'")
+        glob_count = cur.fetchone()[0]
 
-        migrate(conn)
+        if proj_count > 0 or glob_count > 0:
+            print("Existing migration entries: %d project, %d global" % (proj_count, glob_count))
+
+        # Determine which migration to run
+        import sys as _sys
+        if len(_sys.argv) > 1 and _sys.argv[1] == "--memory-files":
+            print("\n=== Migrating auto-memory MEMORY.md files ===")
+            migrate_memory_files(conn)
+        elif len(_sys.argv) > 1 and _sys.argv[1] == "--all":
+            print("\n=== Running full migration (doc-db + memory files) ===")
+            if proj_count > 0:
+                resp = input("Re-run doc-db migration? This may add duplicates. (y/N): ")
+                if resp.lower() == 'y':
+                    migrate(conn)
+            else:
+                migrate(conn)
+            migrate_memory_files(conn)
+        else:
+            if proj_count > 0:
+                print("WARNING: Found %d existing doc-db entries." % proj_count)
+                resp = input("Re-run migration? This will add duplicates. (y/N): ")
+                if resp.lower() != 'y':
+                    print("Aborted. Use --memory-files to migrate only MEMORY.md files.")
+                    _sys.exit(0)
+            migrate(conn)
     finally:
         conn.close()

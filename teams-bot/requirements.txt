@@ -1,0 +1,4 @@
+microsoft-agents-botbuilder>=0.1.0
+microsoft-agents-authorization>=0.1.0
+aiohttp>=3.9.0
+psycopg2-binary>=2.9.0

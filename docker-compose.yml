@@ -24,3 +24,34 @@ services:
     restart: unless-stopped
     stdin_open: true
     tty: true
+
+  teams-bot:
+    build: ./teams-bot
+    container_name: clambake-teams-bot
+    environment:
+      TEAMS_BOT_APP_ID: ${TEAMS_BOT_APP_ID:-}
+      TEAMS_BOT_APP_PASSWORD: ${TEAMS_BOT_APP_PASSWORD:-}
+      CLAMBAKE_DB_HOST: host.docker.internal
+      CLAMBAKE_DB_PORT: "5433"
+      CLAMBAKE_DB_NAME: docdb
+      CLAMBAKE_DB_USER: postgres
+      CLAMBAKE_DB_PASS: postgres
+      POLL_INTERVAL: "30"
+      LOOKBACK_MINUTES: "5"
+    ports:
+      - "3978:3978"
+    restart: unless-stopped
+    profiles:
+      - teams
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: clambake-cloudflared
+    command: tunnel run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    restart: unless-stopped
+    depends_on:
+      - teams-bot
+    profiles:
+      - teams

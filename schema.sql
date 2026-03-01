@@ -88,9 +88,10 @@ CREATE INDEX IF NOT EXISTS idx_project_memory_status
 CREATE INDEX IF NOT EXISTS idx_project_memory_tags
     ON clambake.project_memory USING GIN (tags);
 
--- HNSW index for semantic search (only if embeddings are populated)
--- CREATE INDEX IF NOT EXISTS idx_project_memory_embedding
---     ON clambake.project_memory USING hnsw (embedding vector_cosine_ops);
+-- HNSW index for semantic search (project_memory)
+CREATE INDEX IF NOT EXISTS idx_project_memory_embedding
+    ON clambake.project_memory USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
 
 -- ============================================================
 -- 4. GLOBAL_MEMORY — Cross-project shared knowledge
@@ -111,11 +112,18 @@ CREATE TABLE IF NOT EXISTS clambake.global_memory (
     tags            TEXT[] DEFAULT '{}',
     created_by      TEXT DEFAULT 'human',
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Optional: pgvector embedding for semantic search (768-dim, nomic-embed-text)
+    embedding       vector(768)
 );
 
 CREATE INDEX IF NOT EXISTS idx_global_memory_type
     ON clambake.global_memory (memory_type);
+
+-- HNSW index for semantic search (global_memory)
+CREATE INDEX IF NOT EXISTS idx_global_memory_embedding
+    ON clambake.global_memory USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
 
 -- ============================================================
 -- 5. SESSION_LOG — Audit trail of what happened
@@ -133,7 +141,8 @@ CREATE TABLE IF NOT EXISTS clambake.session_log (
                         'issue_resolved',
                         'docker_operation',
                         'file_modified',
-                        'shutdown'
+                        'shutdown',
+                        'idle'
                     )),
     summary         TEXT NOT NULL,
     files_modified  TEXT[] DEFAULT '{}',
@@ -237,20 +246,172 @@ WHERE t.status = 'pending'
 ORDER BY t.priority DESC, t.created_at ASC;
 
 -- ============================================================
--- CLEANUP FUNCTION — Remove stale data
+-- 8. CONVERSATION_REFERENCES — Teams Bot proactive messaging
 -- ============================================================
-CREATE OR REPLACE FUNCTION clambake.cleanup() RETURNS void AS $$
+CREATE TABLE IF NOT EXISTS clambake.conversation_references (
+    id              SERIAL PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    conversation_type TEXT NOT NULL DEFAULT 'channel'
+                    CHECK (conversation_type IN ('channel', 'personal')),
+    service_url     TEXT NOT NULL,
+    channel_id      TEXT,
+    user_id         TEXT,
+    user_name       TEXT,
+    bot_id          TEXT,
+    reference_json  JSONB NOT NULL,           -- Full ConversationReference for proactive msg
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (conversation_id, user_id)
+);
+
+-- ============================================================
+-- 9. NOTIFICATION_LOG — Prevents duplicate Teams notifications
+-- ============================================================
+CREATE TABLE IF NOT EXISTS clambake.notification_log (
+    id              SERIAL PRIMARY KEY,
+    event_type      TEXT NOT NULL,             -- task_completed, task_failed, agent_registered, blocker, stale_instance
+    event_source_id TEXT NOT NULL,             -- task ID, instance ID, message ID, etc.
+    channel         TEXT NOT NULL DEFAULT 'teams',
+    notified_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (event_type, event_source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_log_time
+    ON clambake.notification_log (notified_at DESC);
+
+-- ============================================================
+-- 10. INFRA_STATE — Live infrastructure status (replaces instance-board.json)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS clambake.infra_state (
+    id              SERIAL PRIMARY KEY,
+    service         TEXT NOT NULL,               -- e.g. 'postgres', 'docker', 'ollama', 'traefik'
+    status          TEXT NOT NULL DEFAULT 'up'
+                    CHECK (status IN ('up', 'down', 'degraded', 'warning')),
+    port            INT,                         -- primary port number
+    container       TEXT,                        -- Docker container name if applicable
+    message         TEXT,                        -- human-readable status/warning message
+    reported_by     TEXT NOT NULL,               -- instance_id that reported this
+    reported_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '4 hours',
+    UNIQUE (service)                             -- one row per service, upserted
+);
+
+CREATE INDEX IF NOT EXISTS idx_infra_state_expires
+    ON clambake.infra_state (expires_at);
+
+-- View: current infrastructure status (non-expired)
+CREATE OR REPLACE VIEW clambake.current_infra AS
+SELECT service, status, port, container, message, reported_by,
+       reported_at,
+       EXTRACT(EPOCH FROM (expires_at - NOW()))::int AS seconds_until_expiry
+FROM clambake.infra_state
+WHERE expires_at > NOW()
+ORDER BY service;
+
+-- ============================================================
+-- 11. TOOL-GATING — Enforced tool allowlists on agent roles
+-- ============================================================
+ALTER TABLE clambake.agent_roles ADD COLUMN IF NOT EXISTS tool_allowlist TEXT[] DEFAULT '{}';
+ALTER TABLE clambake.agent_roles ADD COLUMN IF NOT EXISTS tool_denylist TEXT[] DEFAULT '{}';
+
+-- ============================================================
+-- 12. PIPELINE TRACKING — Pipeline run metadata on tasks
+-- ============================================================
+ALTER TABLE clambake.tasks ADD COLUMN IF NOT EXISTS pipeline_run_id TEXT;
+ALTER TABLE clambake.tasks ADD COLUMN IF NOT EXISTS pipeline_step INT;
+CREATE INDEX IF NOT EXISTS idx_tasks_pipeline_run
+    ON clambake.tasks (pipeline_run_id) WHERE pipeline_run_id IS NOT NULL;
+
+-- ============================================================
+-- 13. PIPELINE_TEMPLATES — Reusable multi-agent workflow definitions
+-- ============================================================
+CREATE TABLE IF NOT EXISTS clambake.pipeline_templates (
+    id          SERIAL PRIMARY KEY,
+    name        TEXT UNIQUE NOT NULL,
+    description TEXT NOT NULL,
+    steps       JSONB NOT NULL,  -- ordered array of {step, role, title_template, description_template}
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- ============================================================
+-- PIPELINE RUNS VIEW — Aggregated pipeline progress
+-- ============================================================
+CREATE OR REPLACE VIEW clambake.pipeline_runs AS
+SELECT
+    t.pipeline_run_id,
+    t.project,
+    COUNT(*) AS total_steps,
+    COUNT(*) FILTER (WHERE t.status = 'done') AS completed_steps,
+    COUNT(*) FILTER (WHERE t.status = 'failed') AS failed_steps,
+    COUNT(*) FILTER (WHERE t.status IN ('claimed', 'in_progress')) AS active_steps,
+    MIN(t.created_at) AS started_at,
+    MAX(t.completed_at) AS last_completed_at,
+    CASE
+        WHEN COUNT(*) FILTER (WHERE t.status = 'failed') > 0 THEN 'failed'
+        WHEN COUNT(*) FILTER (WHERE t.status = 'done') = COUNT(*) THEN 'completed'
+        WHEN COUNT(*) FILTER (WHERE t.status IN ('claimed', 'in_progress')) > 0 THEN 'running'
+        ELSE 'pending'
+    END AS pipeline_status
+FROM clambake.tasks t
+WHERE t.pipeline_run_id IS NOT NULL
+GROUP BY t.pipeline_run_id, t.project;
+
+-- ============================================================
+-- CLEANUP FUNCTION — Remove stale data (returns counts as JSON)
+-- ============================================================
+CREATE OR REPLACE FUNCTION clambake.cleanup()
+RETURNS jsonb AS $$
+DECLARE
+    stale_instances int;
+    expired_messages int;
+    old_logs int;
+    orphaned_tasks int;
+    expired_infra int;
+    dead_instance_ids text[];
 BEGIN
-    -- Mark instances with no heartbeat in 2 hours as gone
+    -- Find instances with no heartbeat in 2 hours
+    SELECT array_agg(instance_id)
+    INTO dead_instance_ids
+    FROM clambake.instances
+    WHERE last_heartbeat < NOW() - INTERVAL '2 hours';
+
+    -- Release tasks claimed by dead instances (no heartbeat in 5 min)
+    UPDATE clambake.tasks
+    SET status = 'pending', assigned_instance = NULL, claimed_at = NULL
+    WHERE status IN ('claimed', 'in_progress')
+      AND assigned_instance IN (
+          SELECT instance_id FROM clambake.instances
+          WHERE last_heartbeat < NOW() - INTERVAL '5 minutes'
+      );
+    GET DIAGNOSTICS orphaned_tasks = ROW_COUNT;
+
+    -- Delete stale instances
     DELETE FROM clambake.instances
     WHERE last_heartbeat < NOW() - INTERVAL '2 hours';
+    GET DIAGNOSTICS stale_instances = ROW_COUNT;
 
     -- Delete expired messages
     DELETE FROM clambake.messages
     WHERE expires_at < NOW();
+    GET DIAGNOSTICS expired_messages = ROW_COUNT;
 
     -- Delete session logs older than 90 days
     DELETE FROM clambake.session_log
     WHERE created_at < NOW() - INTERVAL '90 days';
+    GET DIAGNOSTICS old_logs = ROW_COUNT;
+
+    -- Delete expired infra_state entries
+    DELETE FROM clambake.infra_state
+    WHERE expires_at < NOW();
+    GET DIAGNOSTICS expired_infra = ROW_COUNT;
+
+    RETURN jsonb_build_object(
+        'stale_instances', stale_instances,
+        'expired_messages', expired_messages,
+        'old_logs', old_logs,
+        'orphaned_tasks', orphaned_tasks,
+        'expired_infra', expired_infra
+    );
 END;
 $$ LANGUAGE plpgsql;

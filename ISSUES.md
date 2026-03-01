@@ -152,3 +152,41 @@ Before building a new orchestrator container, verify:
 - [ ] All scripts use `python3` not `python`
 - [ ] All paths are container paths (`/opt/clambake/`) not host paths (`F:/Docker/clambake/`)
 - [ ] `.env` file copied from Swarm Orchestration or created fresh with API key
+
+---
+
+## Issue 14: `update-memory --global --status` Crashes (Missing Column)
+**Problem**: `global_memory` table has no `status` column, but `cmd_update_memory` tries to SET it when `--global --status` is used.
+**Error**: `psycopg2.errors.UndefinedColumn: column "status" of relation "global_memory" does not exist`
+**Root Cause**: `project_memory` has a `status` column (active/resolved/deprecated/superseded) but `global_memory` does not — by design, global knowledge doesn't have lifecycle states.
+**Fix**: Added guard in `cmd_update_memory` — when `--global` is set, `--status` is ignored with a warning message instead of crashing.
+**Status**: FIXED (2026-02-21)
+
+---
+
+## Issue 15: Unicode Emoji Crash on Windows (cp1252 Encoding)
+**Problem**: The `digest` command uses Unicode emoji characters (`⚠` U+26A0, `🚨` U+1F6A8) in print statements. Windows console uses cp1252 encoding which can't encode these characters.
+**Error**: `UnicodeEncodeError: 'charmap' codec can't encode character '\u26a0' in position 6`
+**Affected**: `cmd_digest` function — lines with "Stale Instances" and "Active Blockers" headers.
+**Fix**: Replaced emoji with ASCII equivalents: `⚠` → `[!]`, `🚨` → `[!!]`
+**Note**: Em dashes (`—`, U+2014) are safe — they map to cp1252 `\x97`.
+**Status**: FIXED (2026-02-21)
+
+---
+
+## Semantic Pipeline Verification (2026-02-21)
+All Phase 1 semantic features tested and working:
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `remember --project` with embedding | PASS | Returns "(embedded)" confirmation |
+| `recall --project --search` (semantic) | PASS | Returns results with similarity scores (0.86 for exact match) |
+| `recall --global --search` (semantic) | PASS | Cross-project semantic search works |
+| `recall --project` (text/list mode) | PASS | Non-semantic recall works |
+| `embed-backfill` | PASS | Found and backfilled 1 missing embedding |
+| `register` with CORE MEMORIES | PASS | Shows semantically relevant memories on registration |
+| `cleanup` | PASS | Reports stale instance counts correctly |
+| `update-memory` | PASS | Title, content, and status updates work (with Issue 14 fix) |
+| `digest` | PASS | Shows instances, stale warnings, tasks, memory counts (with Issue 15 fix) |
+| `task-list` | PASS | Returns empty list correctly |
+| `status` | PASS | Shows active instances and recent messages |

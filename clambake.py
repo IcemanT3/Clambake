@@ -6,19 +6,18 @@ A lightweight CLI that Claude Code instances use to coordinate work
 across projects through a shared Postgres database.
 
 Usage:
-    clambake register --project <name> [--dir <path>] [--model <model>]
-    clambake heartbeat [--task <description>] [--status <status>]
-    clambake status
+    clambake up [--project <name>] [--dir <path>]  # One-command startup (register + inbox + recall)
+    clambake down                                    # One-command shutdown (deregister + optional summary)
+    clambake status                                  # Show active instances + recent messages
+    clambake infra                                   # Show live infrastructure status
+    clambake infra-warn --service <name> --status <s> --message <text>
+    clambake remember --project <name> --type <type> --title <text> --content <text>
+    clambake recall --project <name> [--search <query>]
+    clambake recall --global [--search <query>]
     clambake send --to <target> --subject <text> [--body <text>] [--type <type>]
     clambake inbox [--all]
-    clambake read <message_id>
-    clambake remember --project <name> --type <type> --title <text> --content <text> [--tags <t1,t2>]
-    clambake recall --project <name> [--type <type>] [--search <query>] [--limit <n>]
-    clambake recall --global [--type <type>] [--search <query>]
-    clambake log --action <action> --summary <text> [--files <f1,f2>]
-    clambake deregister
-    clambake cleanup
-    clambake init
+    clambake project-list                            # List all known projects with memory counts
+    clambake init                                    # Initialize schema
 """
 
 import argparse
@@ -31,21 +30,25 @@ from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
+import requests
 
 # --- Configuration -----------------------------------------------------------
 
-# Master switch: set CLAMBAKE_ENABLED=1 to activate, 0 or unset to disable.
+# Master switch: defaults to ENABLED. Set CLAMBAKE_ENABLED=0 to disable.
 # When disabled, all commands silently exit 0 (no output, no errors).
 # The 'enable', 'disable', and 'init' commands always run regardless.
-CLAMBAKE_ENABLED = os.environ.get("CLAMBAKE_ENABLED", "0") == "1"
+CLAMBAKE_ENABLED = os.environ.get("CLAMBAKE_ENABLED", "1") == "1"
 CLAMBAKE_FLAG_FILE = Path(os.environ.get(
     "CLAMBAKE_FLAG_FILE",
     Path.home() / ".clambake_enabled"
 ))
 
-# Also check flag file (survives shell restarts without .bashrc editing)
-if not CLAMBAKE_ENABLED and CLAMBAKE_FLAG_FILE.exists():
+# Also check flag file (overrides env if present)
+if CLAMBAKE_FLAG_FILE.exists():
     CLAMBAKE_ENABLED = CLAMBAKE_FLAG_FILE.read_text().strip() == "1"
+
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+EMBEDDING_MODEL = os.environ.get("CLAMBAKE_EMBEDDING_MODEL", "nomic-embed-text")
 
 DB_HOST = os.environ.get("CLAMBAKE_DB_HOST", "localhost")
 DB_PORT = os.environ.get("CLAMBAKE_DB_PORT", "5433")
@@ -59,6 +62,33 @@ INSTANCE_FILE = Path(os.environ.get(
     Path.home() / ".clambake_instance"
 ))
 
+# --- Project detection -------------------------------------------------------
+
+# Optional overrides: directory prefix -> project name.
+# Only needed when the folder name doesn't match the desired project name.
+# Example: "F:/some/nested/path": "my-project"
+PROJECT_OVERRIDES = {}
+
+
+def _normalize_name(name):
+    """Normalize a directory name into a project slug (lowercase, hyphens)."""
+    return name.strip().lower().replace(" ", "-")
+
+
+def detect_project(working_dir=None):
+    """Auto-detect project name from working directory.
+
+    1. Check PROJECT_OVERRIDES for explicit mappings.
+    2. Otherwise derive from the directory name (lowercase, spaces to hyphens).
+    """
+    d = (working_dir or os.getcwd()).replace("\\", "/")
+    # Check explicit overrides first
+    for prefix, project in PROJECT_OVERRIDES.items():
+        if d.startswith(prefix):
+            return project
+    # Default: derive from directory name
+    return _normalize_name(Path(d).name)
+
 
 def get_conn():
     """Get a database connection."""
@@ -66,6 +96,14 @@ def get_conn():
         host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
         user=DB_USER, password=DB_PASS
     )
+
+
+def get_conn_safe():
+    """Get a database connection, or None if Postgres is unreachable."""
+    try:
+        return get_conn()
+    except (psycopg2.OperationalError, psycopg2.Error):
+        return None
 
 
 def get_instance_id():
@@ -88,6 +126,27 @@ def clear_instance_id():
     """Remove instance ID file."""
     if INSTANCE_FILE.exists():
         INSTANCE_FILE.unlink()
+
+
+# --- Embedding ---------------------------------------------------------------
+
+def generate_embedding(text, prefix=""):
+    """Generate a 768-dim embedding via Ollama. Returns list or [] on failure."""
+    try:
+        resp = requests.post(
+            "%s/api/embed" % OLLAMA_BASE_URL,
+            json={"model": EMBEDDING_MODEL, "input": prefix + text},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Ollama returns {"embeddings": [[...]]}
+        embeddings = data.get("embeddings")
+        if embeddings and len(embeddings) > 0:
+            return embeddings[0]
+        return []
+    except Exception:
+        return []
 
 
 # --- Commands ----------------------------------------------------------------
@@ -119,6 +178,20 @@ def cmd_register(args):
 
     conn = get_conn()
     try:
+        # Auto-cleanup stale data before registering
+        counts = _run_cleanup(conn)
+        cleaned = sum(v for v in counts.values() if isinstance(v, int))
+        if cleaned > 0:
+            parts = []
+            if counts.get("stale_instances"):
+                parts.append("%d stale instance(s)" % counts["stale_instances"])
+            if counts.get("orphaned_tasks"):
+                parts.append("%d orphaned task(s)" % counts["orphaned_tasks"])
+            if counts.get("expired_messages"):
+                parts.append("%d expired msg(s)" % counts["expired_messages"])
+            if parts:
+                print("AUTO-CLEANUP: %s" % ", ".join(parts))
+
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO clambake.instances
@@ -154,6 +227,40 @@ def cmd_register(args):
             msg_count = cur.fetchone()["cnt"]
             if msg_count:
                 print("\n%d UNREAD MESSAGE(S) — run 'clambake inbox'" % msg_count)
+
+            # Auto-recall: load core memories for this project
+            project_embedding = generate_embedding(project, prefix="search_query: ")
+            if project_embedding:
+                cur.execute("""
+                    SELECT id, memory_type, title, content,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM clambake.project_memory
+                    WHERE project = %s AND status = 'active'
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT 5
+                """, (project_embedding, project, project_embedding))
+            else:
+                # Fallback: most recent memories
+                cur.execute("""
+                    SELECT id, memory_type, title, content, NULL::float AS similarity
+                    FROM clambake.project_memory
+                    WHERE project = %s AND status = 'active'
+                    ORDER BY updated_at DESC
+                    LIMIT 5
+                """, (project,))
+            memories = cur.fetchall()
+            if memories:
+                print("\nCORE MEMORIES:")
+                for m in memories:
+                    sim = m.get("similarity")
+                    sim_str = " [%.2f]" % sim if sim is not None else ""
+                    preview = m["content"][:200]
+                    if len(m["content"]) > 200:
+                        preview += "..."
+                    print("  #%d [%s]%s %s" % (
+                        m["id"], m["memory_type"], sim_str, m["title"]))
+                    print("    %s" % preview)
     finally:
         conn.close()
 
@@ -349,6 +456,11 @@ def cmd_remember(args):
     tags = [t.strip() for t in args.tags.split(",")] if args.tags else []
     files = [f.strip() for f in args.files.split(",")] if args.files else []
 
+    # Generate embedding from title + content
+    embed_text = args.title + "\n" + args.content
+    embedding = generate_embedding(embed_text)
+    embed_status = "(embedded)" if embedding else "(text only)"
+
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -356,78 +468,152 @@ def cmd_remember(args):
                 # Global memory
                 cur.execute("""
                     INSERT INTO clambake.global_memory
-                        (memory_type, title, content, tags, created_by)
-                    VALUES (%s, %s, %s, %s, %s)
+                        (memory_type, title, content, tags, created_by, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING id
-                """, (args.type, args.title, args.content, tags, created_by))
+                """, (args.type, args.title, args.content, tags, created_by,
+                      embedding if embedding else None))
             else:
                 # Project memory
                 cur.execute("""
                     INSERT INTO clambake.project_memory
                         (project, memory_type, title, content, tags,
-                         related_files, created_by)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                         related_files, created_by, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (args.project, args.type, args.title, args.content,
-                      tags, files, created_by))
+                      tags, files, created_by,
+                      embedding if embedding else None))
             mem_id = cur.fetchone()[0]
         conn.commit()
         scope = "global" if args.glob else args.project
-        print("REMEMBERED: #%d [%s] in %s — %s" % (
-            mem_id, args.type, scope, args.title))
+        print("REMEMBERED: #%d [%s] in %s — %s %s" % (
+            mem_id, args.type, scope, args.title, embed_status))
     finally:
         conn.close()
 
 
 def cmd_recall(args):
     """Query project or global memory."""
+    use_semantic = args.search and not args.text_only
+    query_embedding = []
+    if use_semantic:
+        query_embedding = generate_embedding(args.search, prefix="search_query: ")
+        if not query_embedding:
+            use_semantic = False  # Fallback to text search
+
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            if args.glob:
-                # Global memory
-                query = "SELECT * FROM clambake.global_memory WHERE TRUE"
-                params = []
-                if args.type:
-                    query += " AND memory_type = %s"
-                    params.append(args.type)
-                if args.search:
-                    query += " AND (title ILIKE %s OR content ILIKE %s)"
-                    params.extend(["%%%s%%" % args.search] * 2)
-                query += " ORDER BY updated_at DESC LIMIT %s"
-                params.append(args.limit)
+            if use_semantic:
+                # Semantic search with cosine similarity
+                if args.glob:
+                    query = """
+                        SELECT *, 1 - (embedding <=> %s::vector) AS similarity
+                        FROM clambake.global_memory
+                        WHERE embedding IS NOT NULL
+                    """
+                    params = [query_embedding]
+                    if args.type:
+                        query += " AND memory_type = %s"
+                        params.append(args.type)
+                    query += " ORDER BY embedding <=> %s::vector LIMIT %s"
+                    params.extend([query_embedding, args.limit])
+                else:
+                    query = """
+                        SELECT *, 1 - (embedding <=> %s::vector) AS similarity
+                        FROM clambake.project_memory
+                        WHERE project = %s AND status = 'active'
+                          AND embedding IS NOT NULL
+                    """
+                    params = [query_embedding, args.project]
+                    if args.type:
+                        query += " AND memory_type = %s"
+                        params.append(args.type)
+                    query += " ORDER BY embedding <=> %s::vector LIMIT %s"
+                    params.extend([query_embedding, args.limit])
                 cur.execute(query, params)
-            else:
-                # Project memory
-                query = """
-                    SELECT * FROM clambake.project_memory
-                    WHERE project = %s AND status = 'active'
-                """
-                params = [args.project]
-                if args.type:
-                    query += " AND memory_type = %s"
-                    params.append(args.type)
-                if args.search:
-                    query += " AND (title ILIKE %s OR content ILIKE %s)"
-                    params.extend(["%%%s%%" % args.search] * 2)
-                query += " ORDER BY updated_at DESC LIMIT %s"
-                params.append(args.limit)
-                cur.execute(query, params)
+                semantic_rows = cur.fetchall()
 
-            rows = cur.fetchall()
+                # Also get text-fallback results for entries without embeddings
+                if args.glob:
+                    fallback_query = """
+                        SELECT *, NULL::float AS similarity
+                        FROM clambake.global_memory
+                        WHERE embedding IS NULL
+                          AND (title ILIKE %s OR content ILIKE %s)
+                    """
+                    fallback_params = ["%%%s%%" % args.search] * 2
+                    if args.type:
+                        fallback_query += " AND memory_type = %s"
+                        fallback_params.append(args.type)
+                    fallback_query += " ORDER BY updated_at DESC LIMIT %s"
+                    fallback_params.append(args.limit)
+                else:
+                    fallback_query = """
+                        SELECT *, NULL::float AS similarity
+                        FROM clambake.project_memory
+                        WHERE project = %s AND status = 'active'
+                          AND embedding IS NULL
+                          AND (title ILIKE %s OR content ILIKE %s)
+                    """
+                    fallback_params = [args.project] + ["%%%s%%" % args.search] * 2
+                    if args.type:
+                        fallback_query += " AND memory_type = %s"
+                        fallback_params.append(args.type)
+                    fallback_query += " ORDER BY updated_at DESC LIMIT %s"
+                    fallback_params.append(args.limit)
+                cur.execute(fallback_query, fallback_params)
+                fallback_rows = cur.fetchall()
+
+                rows = semantic_rows + fallback_rows
+            else:
+                # Text-only search (original behavior)
+                if args.glob:
+                    query = "SELECT *, NULL::float AS similarity FROM clambake.global_memory WHERE TRUE"
+                    params = []
+                    if args.type:
+                        query += " AND memory_type = %s"
+                        params.append(args.type)
+                    if args.search:
+                        query += " AND (title ILIKE %s OR content ILIKE %s)"
+                        params.extend(["%%%s%%" % args.search] * 2)
+                    query += " ORDER BY updated_at DESC LIMIT %s"
+                    params.append(args.limit)
+                    cur.execute(query, params)
+                else:
+                    query = """
+                        SELECT *, NULL::float AS similarity FROM clambake.project_memory
+                        WHERE project = %s AND status = 'active'
+                    """
+                    params = [args.project]
+                    if args.type:
+                        query += " AND memory_type = %s"
+                        params.append(args.type)
+                    if args.search:
+                        query += " AND (title ILIKE %s OR content ILIKE %s)"
+                        params.extend(["%%%s%%" % args.search] * 2)
+                    query += " ORDER BY updated_at DESC LIMIT %s"
+                    params.append(args.limit)
+                    cur.execute(query, params)
+
+                rows = cur.fetchall()
 
             if not rows:
                 print("RECALL: no results")
                 return
 
             scope = "GLOBAL" if args.glob else args.project.upper()
-            print("RECALL [%s]: %d result(s)" % (scope, len(rows)))
+            mode = "semantic" if use_semantic else "text"
+            print("RECALL [%s] (%s): %d result(s)" % (scope, mode, len(rows)))
             for r in rows:
                 tags_str = " ".join("#%s" % t for t in (r.get("tags") or []))
                 status = r.get("status", "")
                 status_str = " (%s)" % status if status and status != "active" else ""
-                print("\n  #%d [%s]%s %s %s" % (
-                    r["id"], r["memory_type"], status_str, r["title"], tags_str))
+                sim = r.get("similarity")
+                sim_str = " [%.2f]" % sim if sim is not None else ""
+                print("\n  #%d [%s]%s%s %s %s" % (
+                    r["id"], r["memory_type"], status_str, sim_str, r["title"], tags_str))
                 # Show first 300 chars of content
                 content = r["content"][:300]
                 if len(r["content"]) > 300:
@@ -491,14 +677,27 @@ def cmd_deregister(args):
         conn.close()
 
 
+def _run_cleanup(conn):
+    """Run cleanup and return counts dict. Caller must commit."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT clambake.cleanup()")
+        result = cur.fetchone()[0]
+    conn.commit()
+    if isinstance(result, str):
+        return json.loads(result)
+    return result or {}
+
+
 def cmd_cleanup(args):
     """Run cleanup to remove stale data."""
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT clambake.cleanup()")
-        conn.commit()
-        print("CLEANUP: done")
+        counts = _run_cleanup(conn)
+        print("CLEANUP:")
+        print("  Stale instances removed: %s" % counts.get("stale_instances", 0))
+        print("  Expired messages removed: %s" % counts.get("expired_messages", 0))
+        print("  Old logs removed: %s" % counts.get("old_logs", 0))
+        print("  Orphaned tasks released: %s" % counts.get("orphaned_tasks", 0))
     finally:
         conn.close()
 
@@ -538,15 +737,18 @@ def cmd_role_list(args):
     conn = get_conn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute("SELECT name, description, capabilities FROM clambake.agent_roles ORDER BY name")
+            cur.execute("""
+                SELECT name, description, capabilities, tool_allowlist, tool_denylist
+                FROM clambake.agent_roles ORDER BY name
+            """)
             roles = cur.fetchall()
             if not roles:
-                print("ROLES: none defined. Run 'clambake role seed' to create defaults.")
+                print("ROLES: none defined. Run 'clambake role-seed' to create defaults.")
                 return
             print("=== AGENT ROLES ===")
             for r in roles:
-                caps = ", ".join(r["capabilities"] or [])
-                print("  [%s] %s  (%s)" % (r["name"], r["description"], caps))
+                tools = ", ".join(r.get("tool_allowlist") or []) or "unrestricted"
+                print("  [%s] %s  tools: %s" % (r["name"], r["description"], tools))
     finally:
         conn.close()
 
@@ -564,6 +766,11 @@ def cmd_role_get(args):
             print("ROLE: %s" % r["name"])
             print("  Description: %s" % r["description"])
             print("  Capabilities: %s" % ", ".join(r["capabilities"] or []))
+            allowlist = r.get("tool_allowlist") or []
+            denylist = r.get("tool_denylist") or []
+            print("  Tool Allowlist: %s" % (", ".join(allowlist) if allowlist else "unrestricted"))
+            if denylist:
+                print("  Tool Denylist: %s" % ", ".join(denylist))
             print("  System Prompt:\n%s" % r["system_prompt"])
     finally:
         conn.close()
@@ -572,30 +779,80 @@ def cmd_role_get(args):
 def cmd_role_create(args):
     """Create or update an agent role."""
     caps = [c.strip() for c in args.capabilities.split(",")] if args.capabilities else []
+    allowlist = [t.strip() for t in args.tool_allowlist.split(",")] if args.tool_allowlist else []
+    denylist = [t.strip() for t in args.tool_denylist.split(",")] if args.tool_denylist else []
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO clambake.agent_roles (name, description, system_prompt, capabilities)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO clambake.agent_roles
+                    (name, description, system_prompt, capabilities, tool_allowlist, tool_denylist)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (name) DO UPDATE SET
                     description = EXCLUDED.description,
                     system_prompt = EXCLUDED.system_prompt,
                     capabilities = EXCLUDED.capabilities,
+                    tool_allowlist = EXCLUDED.tool_allowlist,
+                    tool_denylist = EXCLUDED.tool_denylist,
                     updated_at = NOW()
-            """, (args.name, args.description, args.prompt, caps))
+            """, (args.name, args.description, args.prompt, caps, allowlist, denylist))
         conn.commit()
         print("ROLE: '%s' saved" % args.name)
     finally:
         conn.close()
 
 
+def cmd_role_get_tools(args):
+    """Output tool allowlist for shell consumption (used by agent-worker.sh)."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT tool_allowlist, tool_denylist
+                FROM clambake.agent_roles WHERE name = %s
+            """, (args.name,))
+            r = cur.fetchone()
+            if not r:
+                print("ERROR: Role '%s' not found" % args.name)
+                sys.exit(1)
+            allowlist = r.get("tool_allowlist") or []
+            if not allowlist:
+                print("none")
+                return
+            if args.format == "allowlist":
+                # Space-separated for shell --allowedTools flag
+                print(" ".join(allowlist))
+            elif args.format == "json":
+                print(json.dumps(allowlist))
+            else:
+                for t in allowlist:
+                    print(t)
+    finally:
+        conn.close()
+
+
 def cmd_role_seed(args):
-    """Seed the four default agent roles."""
+    """Seed the eight default agent roles with tool-gating."""
     roles = [
         {
+            "name": "scout",
+            "description": "Read-only recon: explores codebase, reports structure/patterns/issues.",
+            "system_prompt": (
+                "You are the Scout. Your job is to explore the codebase and report what you find.\n\n"
+                "RULES:\n"
+                "- Read files, search for patterns, understand project structure\n"
+                "- Report findings: file organization, dependencies, potential issues, patterns\n"
+                "- Store important discoveries via 'clambake remember'\n"
+                "- Send findings to other agents via 'clambake send'\n"
+                "- You CANNOT edit files or run non-git commands\n"
+                "- Focus on thoroughness — other agents depend on your recon"
+            ),
+            "capabilities": ["read_code", "search", "report"],
+            "tool_allowlist": ["Read", "Glob", "Grep", "Bash(git:*)"],
+        },
+        {
             "name": "planner",
-            "description": "Reads codebase, designs architecture, writes specs. Does not code.",
+            "description": "Designs architecture, writes specs, dispatches subtasks. Does not code.",
             "system_prompt": (
                 "You are the Planner. Your job is to read the codebase, understand the architecture, "
                 "and write detailed implementation specs for other agents.\n\n"
@@ -605,10 +862,28 @@ def cmd_role_seed(args):
                 "- Each subtask should specify: files to create/modify, expected behavior, acceptance criteria\n"
                 "- Assign a file_scope to each subtask so agents don't conflict\n"
                 "- DO NOT write code — only specs and plans\n"
-                "- Use 'clambake task create' to dispatch subtasks when your plan is ready\n"
+                "- Use 'clambake task-create' to dispatch subtasks when your plan is ready\n"
                 "- Use 'clambake remember' to store architecture decisions"
             ),
-            "capabilities": ["read_code", "write_specs", "create_tasks"]
+            "capabilities": ["read_code", "write_specs", "create_tasks"],
+            "tool_allowlist": ["Read", "Glob", "Grep", "Bash(git:*)"],
+        },
+        {
+            "name": "plan-reviewer",
+            "description": "Critiques plans for completeness, feasibility, and risks.",
+            "system_prompt": (
+                "You are the Plan Reviewer. You critique implementation plans from the Planner.\n\n"
+                "RULES:\n"
+                "- Read the plan/spec in your task description carefully\n"
+                "- Read the relevant codebase to verify feasibility\n"
+                "- Provide structured feedback: strengths, issues, missing items, recommendations\n"
+                "- Flag risks: breaking changes, performance concerns, security gaps\n"
+                "- You CANNOT edit files — only read and provide feedback\n"
+                "- Use 'clambake send' to communicate feedback to the planner\n"
+                "- When done, mark task done with your review as the result"
+            ),
+            "capabilities": ["read_code", "review_plans"],
+            "tool_allowlist": ["Read", "Glob", "Grep", "Bash(git:*)"],
         },
         {
             "name": "coder",
@@ -621,10 +896,11 @@ def cmd_role_seed(args):
                 "- Write clean, working code that meets the acceptance criteria\n"
                 "- DO NOT write tests — QA handles that\n"
                 "- DO NOT refactor code outside your scope\n"
-                "- When done, run 'clambake task done <id>' with a summary of what you built\n"
-                "- If blocked, run 'clambake task fail <id> --result \"reason\"' and it will be reassigned"
+                "- When done, run 'clambake task-done <id>' with a summary of what you built\n"
+                "- If blocked, run 'clambake task-fail <id> --result \"reason\"' and it will be reassigned"
             ),
-            "capabilities": ["write_code", "read_code"]
+            "capabilities": ["write_code", "read_code"],
+            "tool_allowlist": ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
         },
         {
             "name": "qa",
@@ -635,28 +911,64 @@ def cmd_role_seed(args):
                 "- Read the original task spec to understand expected behavior\n"
                 "- Write tests that verify the acceptance criteria\n"
                 "- Run the tests and report results\n"
-                "- If you find bugs, use 'clambake task create' to file a bug fix task for the coder\n"
+                "- If you find bugs, use 'clambake task-create' to file a bug fix task for the coder\n"
                 "- DO NOT fix bugs yourself — report them\n"
-                "- When all tests pass, run 'clambake task done <id>' with test results\n"
+                "- When all tests pass, run 'clambake task-done <id>' with test results\n"
                 "- Use 'clambake send' to notify the coder of any issues found"
             ),
-            "capabilities": ["read_code", "write_tests", "run_tests", "create_tasks"]
+            "capabilities": ["read_code", "write_tests", "run_tests", "create_tasks"],
+            "tool_allowlist": ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
         },
         {
             "name": "reviewer",
-            "description": "Reviews code for quality, security, and patterns. Approves or rejects.",
+            "description": "Reviews code for quality, security, and patterns. Can run tests but cannot edit.",
             "system_prompt": (
                 "You are the Reviewer. You review code changes for quality and correctness.\n\n"
                 "RULES:\n"
                 "- Read the task spec and the code that was written\n"
                 "- Check for: correctness, security issues, code quality, adherence to patterns\n"
-                "- If approved, run 'clambake task done <id>' with your review notes\n"
-                "- If rejected, run 'clambake task fail <id>' with specific feedback\n"
+                "- You can run tests and commands to verify behavior\n"
+                "- If approved, run 'clambake task-done <id>' with your review notes\n"
+                "- If rejected, run 'clambake task-fail <id>' with specific feedback\n"
                 "- DO NOT modify code yourself — only review and provide feedback\n"
                 "- Use 'clambake remember' to document patterns you want enforced"
             ),
-            "capabilities": ["read_code", "review"]
-        }
+            "capabilities": ["read_code", "run_tests", "review"],
+            "tool_allowlist": ["Read", "Glob", "Grep", "Bash"],
+        },
+        {
+            "name": "documenter",
+            "description": "Writes and updates documentation. No shell access.",
+            "system_prompt": (
+                "You are the Documenter. You write and maintain project documentation.\n\n"
+                "RULES:\n"
+                "- Read existing code and docs to understand the project\n"
+                "- Write clear, accurate documentation (README, API docs, inline comments)\n"
+                "- Update existing docs when code changes\n"
+                "- You CANNOT run shell commands — documentation only\n"
+                "- Use 'clambake remember' to store documentation decisions\n"
+                "- When done, mark task done with a list of files updated"
+            ),
+            "capabilities": ["read_code", "write_docs"],
+            "tool_allowlist": ["Read", "Glob", "Grep", "Edit", "Write"],
+        },
+        {
+            "name": "red-team",
+            "description": "Security testing: finds vulnerabilities, files fix tasks for critical findings.",
+            "system_prompt": (
+                "You are the Red Team agent. You find security vulnerabilities.\n\n"
+                "RULES:\n"
+                "- Read code looking for security issues (injection, auth bypass, data exposure, etc.)\n"
+                "- Run commands to test for vulnerabilities (curl, network probes, etc.)\n"
+                "- You CANNOT edit code — only identify and report issues\n"
+                "- For critical findings, use 'clambake task-create' to file a fix task for the coder\n"
+                "- Classify findings: critical, high, medium, low\n"
+                "- Use 'clambake send' to alert team of critical findings\n"
+                "- When done, mark task done with a security report as the result"
+            ),
+            "capabilities": ["read_code", "security_testing", "create_tasks"],
+            "tool_allowlist": ["Read", "Glob", "Grep", "Bash"],
+        },
     ]
 
     conn = get_conn()
@@ -664,16 +976,314 @@ def cmd_role_seed(args):
         with conn.cursor() as cur:
             for r in roles:
                 cur.execute("""
-                    INSERT INTO clambake.agent_roles (name, description, system_prompt, capabilities)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO clambake.agent_roles
+                        (name, description, system_prompt, capabilities, tool_allowlist)
+                    VALUES (%s, %s, %s, %s, %s)
                     ON CONFLICT (name) DO UPDATE SET
                         description = EXCLUDED.description,
                         system_prompt = EXCLUDED.system_prompt,
                         capabilities = EXCLUDED.capabilities,
+                        tool_allowlist = EXCLUDED.tool_allowlist,
                         updated_at = NOW()
-                """, (r["name"], r["description"], r["system_prompt"], r["capabilities"]))
+                """, (r["name"], r["description"], r["system_prompt"],
+                      r["capabilities"], r["tool_allowlist"]))
         conn.commit()
-        print("SEEDED: %d agent roles (planner, coder, qa, reviewer)" % len(roles))
+        role_names = ", ".join(r["name"] for r in roles)
+        print("SEEDED: %d agent roles (%s)" % (len(roles), role_names))
+    finally:
+        conn.close()
+
+
+def cmd_pipeline_seed(args):
+    """Seed the default pipeline templates."""
+    templates = [
+        {
+            "name": "plan-build-review",
+            "description": "Standard dev cycle: plan, build, review",
+            "steps": json.dumps([
+                {"step": 1, "role": "planner",
+                 "title_template": "Plan: $INPUT",
+                 "description_template": "Analyze the codebase and create a detailed implementation plan for: $INPUT"},
+                {"step": 2, "role": "coder",
+                 "title_template": "Build: $INPUT",
+                 "description_template": "Implement the following plan:\n\n$PREV_RESULT"},
+                {"step": 3, "role": "reviewer",
+                 "title_template": "Review: $INPUT",
+                 "description_template": "Review the implementation:\n\nOriginal request: $ORIGINAL\n\nImplementation notes:\n$PREV_RESULT"},
+            ]),
+        },
+        {
+            "name": "full-pipeline",
+            "description": "Complete cycle: scout, plan, build, test, review",
+            "steps": json.dumps([
+                {"step": 1, "role": "scout",
+                 "title_template": "Scout: $INPUT",
+                 "description_template": "Explore the codebase and report relevant findings for: $INPUT"},
+                {"step": 2, "role": "planner",
+                 "title_template": "Plan: $INPUT",
+                 "description_template": "Create an implementation plan based on scout findings:\n\n$PREV_RESULT\n\nOriginal request: $ORIGINAL"},
+                {"step": 3, "role": "coder",
+                 "title_template": "Build: $INPUT",
+                 "description_template": "Implement the following plan:\n\n$PREV_RESULT"},
+                {"step": 4, "role": "qa",
+                 "title_template": "Test: $INPUT",
+                 "description_template": "Write and run tests for the implementation:\n\nOriginal request: $ORIGINAL\n\nImplementation notes:\n$PREV_RESULT"},
+                {"step": 5, "role": "reviewer",
+                 "title_template": "Review: $INPUT",
+                 "description_template": "Final review of the implementation:\n\nOriginal request: $ORIGINAL\n\nTest results:\n$PREV_RESULT"},
+            ]),
+        },
+        {
+            "name": "plan-review-plan",
+            "description": "Iterative planning: plan, critique, refine",
+            "steps": json.dumps([
+                {"step": 1, "role": "planner",
+                 "title_template": "Draft plan: $INPUT",
+                 "description_template": "Create an initial implementation plan for: $INPUT"},
+                {"step": 2, "role": "plan-reviewer",
+                 "title_template": "Critique plan: $INPUT",
+                 "description_template": "Review this plan for completeness, feasibility, and risks:\n\n$PREV_RESULT"},
+                {"step": 3, "role": "planner",
+                 "title_template": "Refine plan: $INPUT",
+                 "description_template": "Revise the plan based on reviewer feedback:\n\nOriginal plan: $ORIGINAL\n\nReview feedback:\n$PREV_RESULT"},
+            ]),
+        },
+        {
+            "name": "build-test",
+            "description": "Quick build and test cycle",
+            "steps": json.dumps([
+                {"step": 1, "role": "coder",
+                 "title_template": "Build: $INPUT",
+                 "description_template": "Implement: $INPUT"},
+                {"step": 2, "role": "qa",
+                 "title_template": "Test: $INPUT",
+                 "description_template": "Write and run tests for the implementation:\n\nOriginal request: $ORIGINAL\n\nImplementation notes:\n$PREV_RESULT"},
+            ]),
+        },
+        {
+            "name": "security-audit",
+            "description": "Security focused: scout, red-team, document",
+            "steps": json.dumps([
+                {"step": 1, "role": "scout",
+                 "title_template": "Recon for security: $INPUT",
+                 "description_template": "Explore the codebase with a security focus. Map attack surfaces, auth flows, data handling for: $INPUT"},
+                {"step": 2, "role": "red-team",
+                 "title_template": "Security test: $INPUT",
+                 "description_template": "Perform security testing based on recon findings:\n\n$PREV_RESULT\n\nOriginal scope: $ORIGINAL"},
+                {"step": 3, "role": "documenter",
+                 "title_template": "Security report: $INPUT",
+                 "description_template": "Write a security audit report based on findings:\n\nOriginal scope: $ORIGINAL\n\nSecurity findings:\n$PREV_RESULT"},
+            ]),
+        },
+    ]
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            for t in templates:
+                cur.execute("""
+                    INSERT INTO clambake.pipeline_templates (name, description, steps)
+                    VALUES (%s, %s, %s::jsonb)
+                    ON CONFLICT (name) DO UPDATE SET
+                        description = EXCLUDED.description,
+                        steps = EXCLUDED.steps,
+                        updated_at = NOW()
+                """, (t["name"], t["description"], t["steps"]))
+        conn.commit()
+        names = ", ".join(t["name"] for t in templates)
+        print("SEEDED: %d pipeline templates (%s)" % (len(templates), names))
+    finally:
+        conn.close()
+
+
+def cmd_pipeline_list(args):
+    """List all pipeline templates."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT name, description, steps
+                FROM clambake.pipeline_templates ORDER BY name
+            """)
+            templates = cur.fetchall()
+            if not templates:
+                print("PIPELINES: none defined. Run 'clambake pipeline-seed' to create defaults.")
+                return
+            print("=== PIPELINE TEMPLATES ===")
+            for t in templates:
+                steps = t["steps"] if isinstance(t["steps"], list) else json.loads(t["steps"])
+                roles = " -> ".join(s["role"] for s in steps)
+                print("  [%s] %s  (%d steps: %s)" % (
+                    t["name"], t["description"], len(steps), roles))
+    finally:
+        conn.close()
+
+
+def cmd_pipeline_run(args):
+    """Create chained tasks from a pipeline template."""
+    instance_id, _ = get_instance_id()
+    created_by = instance_id or "human"
+
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Fetch template
+            cur.execute("""
+                SELECT * FROM clambake.pipeline_templates WHERE name = %s
+            """, (args.pipeline,))
+            template = cur.fetchone()
+            if not template:
+                print("ERROR: Pipeline '%s' not found. Run 'clambake pipeline-list'." % args.pipeline)
+                sys.exit(1)
+
+            steps = template["steps"] if isinstance(template["steps"], list) else json.loads(template["steps"])
+            run_id = "pipe-%s" % str(uuid.uuid4())[:8]
+            task_ids = []
+
+            for step_def in steps:
+                step_num = step_def["step"]
+                # Substitute $INPUT and $ORIGINAL (both are the user's input)
+                title = step_def["title_template"].replace("$INPUT", args.input).replace("$ORIGINAL", args.input)
+                desc = step_def["description_template"].replace("$INPUT", args.input).replace("$ORIGINAL", args.input)
+                # $PREV_RESULT stays as a placeholder — resolved at claim time by agent-worker.sh
+
+                depends = [task_ids[-1]] if task_ids else []
+
+                cur.execute("""
+                    INSERT INTO clambake.tasks
+                        (title, description, project, priority, assigned_role,
+                         depends_on, created_by, pipeline_run_id, pipeline_step)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (title, desc, args.project, args.priority, step_def["role"],
+                      depends, created_by, run_id, step_num))
+                task_id = cur.fetchone()["id"]
+                task_ids.append(task_id)
+
+        conn.commit()
+
+        print("PIPELINE RUN: %s" % run_id)
+        print("  Template: %s (%s)" % (template["name"], template["description"]))
+        print("  Project: %s" % args.project)
+        print("  Tasks created: %d" % len(task_ids))
+        for i, (step_def, tid) in enumerate(zip(steps, task_ids)):
+            deps_str = " (depends on #%d)" % task_ids[i - 1] if i > 0 else " (ready)"
+            print("    Step %d: #%d [%s] %s%s" % (
+                step_def["step"], tid, step_def["role"],
+                step_def["title_template"].replace("$INPUT", args.input)[:60], deps_str))
+    finally:
+        conn.close()
+
+
+def cmd_pipeline_status(args):
+    """Show pipeline run progress."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if args.run_id:
+                # Specific run
+                cur.execute("""
+                    SELECT * FROM clambake.pipeline_runs WHERE pipeline_run_id = %s
+                """, (args.run_id,))
+                run = cur.fetchone()
+                if not run:
+                    print("ERROR: Pipeline run '%s' not found" % args.run_id)
+                    sys.exit(1)
+
+                print("PIPELINE: %s [%s]" % (run["pipeline_run_id"], run["pipeline_status"]))
+                print("  Project: %s" % run["project"])
+                print("  Progress: %d/%d completed, %d active, %d failed" % (
+                    run["completed_steps"], run["total_steps"],
+                    run["active_steps"], run["failed_steps"]))
+
+                # Show individual tasks
+                cur.execute("""
+                    SELECT id, pipeline_step, title, status, assigned_role, assigned_instance, result
+                    FROM clambake.tasks
+                    WHERE pipeline_run_id = %s
+                    ORDER BY pipeline_step
+                """, (args.run_id,))
+                tasks = cur.fetchall()
+                print("\n  Steps:")
+                for t in tasks:
+                    inst = t["assigned_instance"][:8] if t["assigned_instance"] else "-"
+                    result_preview = ""
+                    if t["result"]:
+                        result_preview = " — %s" % t["result"][:80]
+                    print("    Step %d: #%d [%s] %s -> %s%s" % (
+                        t["pipeline_step"], t["id"], t["status"],
+                        t["assigned_role"], inst, result_preview))
+            else:
+                # List all recent runs
+                cur.execute("""
+                    SELECT * FROM clambake.pipeline_runs
+                    ORDER BY started_at DESC LIMIT 20
+                """)
+                runs = cur.fetchall()
+                if not runs:
+                    print("PIPELINE RUNS: none")
+                    return
+                print("=== PIPELINE RUNS ===")
+                for r in runs:
+                    ts = r["started_at"].strftime("%m/%d %H:%M") if r["started_at"] else "?"
+                    print("  [%s] %s (%s) %d/%d steps — %s" % (
+                        r["pipeline_status"], r["pipeline_run_id"], r["project"],
+                        r["completed_steps"], r["total_steps"], ts))
+    finally:
+        conn.close()
+
+
+def cmd_pipeline_prev_result(args):
+    """Get the previous pipeline step's result (internal, for agent-worker.sh)."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Get this task's pipeline info
+            cur.execute("""
+                SELECT pipeline_run_id, pipeline_step
+                FROM clambake.tasks WHERE id = %s
+            """, (args.task_id,))
+            task = cur.fetchone()
+            if not task or not task["pipeline_run_id"]:
+                print("")
+                return
+
+            if task["pipeline_step"] <= 1:
+                print("")
+                return
+
+            # Get previous step's result
+            prev_step = task["pipeline_step"] - 1
+            cur.execute("""
+                SELECT result FROM clambake.tasks
+                WHERE pipeline_run_id = %s AND pipeline_step = %s
+            """, (task["pipeline_run_id"], prev_step))
+            prev = cur.fetchone()
+            if prev and prev["result"]:
+                print(prev["result"])
+            else:
+                print("")
+    finally:
+        conn.close()
+
+
+def cmd_task_get_meta(args):
+    """Get a single task field (internal, for agent-worker.sh)."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM clambake.tasks WHERE id = %s", (args.task_id,))
+            task = cur.fetchone()
+            if not task:
+                print("")
+                return
+            val = task.get(args.field, "")
+            if val is None:
+                print("")
+            elif isinstance(val, list):
+                print(",".join(str(x) for x in val))
+            else:
+                print(str(val))
     finally:
         conn.close()
 
@@ -881,18 +1491,36 @@ def cmd_update_memory(args):
     """Update an existing memory entry."""
     conn = get_conn()
     try:
-        with conn.cursor() as cur:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             updates = ["updated_at = NOW()"]
             params = []
             if args.content:
                 updates.append("content = %s")
                 params.append(args.content)
             if args.status:
-                updates.append("status = %s")
-                params.append(args.status)
+                if args.glob:
+                    print("WARNING: --status is not supported for global memory (no status column). Ignoring.")
+                else:
+                    updates.append("status = %s")
+                    params.append(args.status)
             if args.title:
                 updates.append("title = %s")
                 params.append(args.title)
+
+            # Re-generate embedding if title or content changed
+            if args.title or args.content:
+                table = "clambake.global_memory" if args.glob else "clambake.project_memory"
+                cur.execute("SELECT title, content FROM %s WHERE id = %%s" % table,
+                            (args.memory_id,))
+                existing = cur.fetchone()
+                if existing:
+                    new_title = args.title or existing["title"]
+                    new_content = args.content or existing["content"]
+                    embedding = generate_embedding(new_title + "\n" + new_content)
+                    if embedding:
+                        updates.append("embedding = %s")
+                        params.append(embedding)
+
             params.append(args.memory_id)
 
             table = "clambake.global_memory" if args.glob else "clambake.project_memory"
@@ -905,6 +1533,427 @@ def cmd_update_memory(args):
                 sys.exit(1)
         conn.commit()
         print("UPDATED: memory #%s" % args.memory_id)
+    finally:
+        conn.close()
+
+
+def cmd_digest(args):
+    """Show activity summary for last N hours."""
+    hours = args.hours
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            print("=== CLAMBAKE DIGEST (last %dh) ===" % hours)
+
+            # Active instances
+            cur.execute("SELECT * FROM clambake.active_instances")
+            instances = cur.fetchall()
+            print("\n--- Active Instances ---")
+            if not instances:
+                print("  (none)")
+            for i in instances:
+                task = i["current_task"] or "idle"
+                age = i["seconds_since_heartbeat"]
+                stale = " [!] STALE" if age > 300 else ""
+                print("  [%s] %s — %s (heartbeat %ds ago)%s" % (
+                    i["status"], i["project"], task, age, stale))
+
+            # Stale instances (heartbeat > 5 min but < 2h — not yet cleaned)
+            cur.execute("""
+                SELECT instance_id, project, current_task,
+                       EXTRACT(EPOCH FROM (NOW() - last_heartbeat))::int AS age
+                FROM clambake.instances
+                WHERE last_heartbeat < NOW() - INTERVAL '5 minutes'
+                  AND last_heartbeat > NOW() - INTERVAL '2 hours'
+            """)
+            stale = cur.fetchall()
+            if stale:
+                print("\n--- [!] Stale Instances ---")
+                for s in stale:
+                    print("  %s (%s) — no heartbeat for %ds" % (
+                        s["project"], s["instance_id"], s["age"]))
+
+            # Active blockers
+            cur.execute("""
+                SELECT id, from_project, subject, created_at
+                FROM clambake.messages
+                WHERE message_type = 'blocker' AND NOT is_read
+                  AND created_at > NOW() - INTERVAL '%s hours'
+            """, (hours,))
+            blockers = cur.fetchall()
+            if blockers:
+                print("\n--- [!!] Active Blockers ---")
+                for b in blockers:
+                    ts = b["created_at"].strftime("%m/%d %H:%M")
+                    print("  #%d [%s] %s — %s" % (
+                        b["id"], ts, b["from_project"] or "?", b["subject"]))
+
+            # Task counts
+            cur.execute("""
+                SELECT status, COUNT(*) as cnt
+                FROM clambake.tasks
+                WHERE created_at > NOW() - INTERVAL '%s hours'
+                   OR status IN ('pending', 'claimed', 'in_progress')
+                GROUP BY status
+                ORDER BY status
+            """, (hours,))
+            task_counts = {r["status"]: r["cnt"] for r in cur.fetchall()}
+            print("\n--- Tasks ---")
+            for status in ["pending", "claimed", "in_progress", "done", "failed"]:
+                cnt = task_counts.get(status, 0)
+                if cnt:
+                    print("  %s: %d" % (status, cnt))
+            if not task_counts:
+                print("  (no tasks)")
+
+            # Recently completed tasks
+            cur.execute("""
+                SELECT id, title, project, assigned_role, completed_at
+                FROM clambake.tasks
+                WHERE status = 'done'
+                  AND completed_at > NOW() - INTERVAL '%s hours'
+                ORDER BY completed_at DESC LIMIT 10
+            """, (hours,))
+            done_tasks = cur.fetchall()
+            if done_tasks:
+                print("\n--- Recently Completed ---")
+                for t in done_tasks:
+                    ts = t["completed_at"].strftime("%m/%d %H:%M")
+                    role = t["assigned_role"] or "any"
+                    print("  #%d [%s] %s (%s) — %s" % (
+                        t["id"], ts, t["project"], role, t["title"]))
+
+            # Memory additions
+            cur.execute("""
+                SELECT COUNT(*) as cnt FROM clambake.project_memory
+                WHERE created_at > NOW() - INTERVAL '%s hours'
+            """, (hours,))
+            proj_mem = cur.fetchone()["cnt"]
+            cur.execute("""
+                SELECT COUNT(*) as cnt FROM clambake.global_memory
+                WHERE created_at > NOW() - INTERVAL '%s hours'
+            """, (hours,))
+            glob_mem = cur.fetchone()["cnt"]
+            if proj_mem or glob_mem:
+                print("\n--- Memory ---")
+                print("  New project memories: %d" % proj_mem)
+                print("  New global memories: %d" % glob_mem)
+
+            # Messages sent
+            cur.execute("""
+                SELECT message_type, COUNT(*) as cnt
+                FROM clambake.messages
+                WHERE created_at > NOW() - INTERVAL '%s hours'
+                GROUP BY message_type
+            """, (hours,))
+            msg_counts = cur.fetchall()
+            if msg_counts:
+                print("\n--- Messages ---")
+                for m in msg_counts:
+                    print("  %s: %d" % (m["message_type"], m["cnt"]))
+
+            # Session log summary
+            cur.execute("""
+                SELECT action, COUNT(*) as cnt
+                FROM clambake.session_log
+                WHERE created_at > NOW() - INTERVAL '%s hours'
+                GROUP BY action
+                ORDER BY cnt DESC
+            """, (hours,))
+            log_counts = cur.fetchall()
+            if log_counts:
+                print("\n--- Session Log ---")
+                for l in log_counts:
+                    print("  %s: %d" % (l["action"], l["cnt"]))
+    finally:
+        conn.close()
+
+
+def cmd_embed_backfill(args):
+    """Generate embeddings for all memories that don't have them."""
+    conn = get_conn()
+    try:
+        success = 0
+        fail = 0
+        total = 0
+
+        for table in ["clambake.project_memory", "clambake.global_memory"]:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT id, title, content FROM %s WHERE embedding IS NULL" % table)
+                rows = cur.fetchall()
+                total += len(rows)
+
+                for r in rows:
+                    text = r["title"] + "\n" + r["content"]
+                    embedding = generate_embedding(text)
+                    if embedding:
+                        cur.execute(
+                            "UPDATE %s SET embedding = %%s WHERE id = %%s" % table,
+                            (embedding, r["id"])
+                        )
+                        success += 1
+                        print("  OK: %s #%d — %s" % (table.split(".")[-1], r["id"], r["title"][:60]))
+                    else:
+                        fail += 1
+                        print("  FAIL: %s #%d — %s" % (table.split(".")[-1], r["id"], r["title"][:60]))
+            conn.commit()
+
+        print("\nBACKFILL: %d total, %d embedded, %d failed" % (total, success, fail))
+    finally:
+        conn.close()
+
+
+# --- New unified commands: up / down / infra / project-list ------------------
+
+def cmd_up(args):
+    """One-command session startup: register + inbox + recall project + recall global warnings + check infra."""
+    conn = get_conn_safe()
+    if not conn:
+        print("CLAMBAKE: Postgres unreachable (localhost:%s). Running without coordination." % DB_PORT)
+        return
+
+    try:
+        working_dir = args.dir or os.getcwd()
+        project = args.project or detect_project(working_dir)
+        instance_id = str(uuid.uuid4())[:12]
+        model = args.model or "opus"
+
+        # Auto-cleanup stale data
+        counts = _run_cleanup(conn)
+        cleaned = sum(v for v in counts.values() if isinstance(v, int))
+
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Register
+            cur.execute("""
+                INSERT INTO clambake.instances
+                    (instance_id, project, working_dir, model, status)
+                VALUES (%s, %s, %s, %s, 'active')
+                ON CONFLICT (instance_id) DO UPDATE SET
+                    last_heartbeat = NOW(), status = 'active'
+            """, (instance_id, project, working_dir, model))
+        conn.commit()
+        save_instance_id(instance_id, project)
+
+        print("=== CLAMBAKE UP ===")
+        print("  Instance: %s | Project: %s" % (instance_id, project))
+        if cleaned > 0:
+            print("  Auto-cleaned %d stale entries" % cleaned)
+
+        # Other active instances
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT instance_id, project, current_task, status
+                FROM clambake.active_instances
+                WHERE instance_id != %s
+            """, (instance_id,))
+            others = cur.fetchall()
+            if others:
+                print("\n--- Active Instances ---")
+                for o in others:
+                    task = o["current_task"] or "idle"
+                    print("  [%s] %s — %s (%s)" % (
+                        o["status"], o["project"], task, o["instance_id"]))
+
+            # Unread messages
+            cur.execute("""
+                SELECT id, from_project, message_type, subject, body, created_at
+                FROM clambake.messages
+                WHERE (to_target IN (%s, %s, '@all')) AND NOT is_read
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                ORDER BY created_at DESC LIMIT 10
+            """, (instance_id, project))
+            messages = cur.fetchall()
+            if messages:
+                print("\n--- Inbox (%d unread) ---" % len(messages))
+                for m in messages:
+                    proj = m["from_project"] or "?"
+                    print("  [%s] %s — %s" % (m["message_type"], proj, m["subject"]))
+
+            # Infrastructure warnings
+            cur.execute("""
+                SELECT service, status, message FROM clambake.current_infra
+                WHERE status IN ('down', 'degraded', 'warning')
+            """)
+            warnings = cur.fetchall()
+            if warnings:
+                print("\n--- [!] Infrastructure Warnings ---")
+                for w in warnings:
+                    print("  [%s] %s — %s" % (w["status"].upper(), w["service"], w["message"] or ""))
+
+            # Project memories (semantic if possible, else recent)
+            project_embedding = generate_embedding(project, prefix="search_query: ")
+            if project_embedding:
+                cur.execute("""
+                    SELECT id, memory_type, title, content,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM clambake.project_memory
+                    WHERE project = %s AND status = 'active'
+                      AND embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT 5
+                """, (project_embedding, project, project_embedding))
+            else:
+                cur.execute("""
+                    SELECT id, memory_type, title, content, NULL::float AS similarity
+                    FROM clambake.project_memory
+                    WHERE project = %s AND status = 'active'
+                    ORDER BY updated_at DESC
+                    LIMIT 5
+                """, (project,))
+            memories = cur.fetchall()
+            if memories:
+                print("\n--- Project Memories (%s) ---" % project)
+                for m in memories:
+                    sim = m.get("similarity")
+                    sim_str = " [%.2f]" % sim if sim is not None else ""
+                    preview = m["content"][:200]
+                    if len(m["content"]) > 200:
+                        preview += "..."
+                    print("  #%d [%s]%s %s" % (m["id"], m["memory_type"], sim_str, m["title"]))
+
+            # Global warnings/lessons (recent)
+            cur.execute("""
+                SELECT id, memory_type, title FROM clambake.global_memory
+                WHERE memory_type IN ('infrastructure', 'lesson')
+                ORDER BY updated_at DESC LIMIT 5
+            """)
+            global_mem = cur.fetchall()
+            if global_mem:
+                print("\n--- Global Knowledge ---")
+                for g in global_mem:
+                    print("  #%d [%s] %s" % (g["id"], g["memory_type"], g["title"]))
+
+        print("\n=== READY ===")
+    finally:
+        conn.close()
+
+
+def cmd_down(args):
+    """One-command session shutdown: deregister + optional summary."""
+    instance_id, project = get_instance_id()
+    if not instance_id:
+        print("Not registered.")
+        return
+
+    conn = get_conn_safe()
+    if not conn:
+        clear_instance_id()
+        print("DEREGISTERED: %s (Postgres unreachable, cleared local state)" % instance_id)
+        return
+
+    try:
+        with conn.cursor() as cur:
+            # Log shutdown with optional summary
+            summary = args.summary if hasattr(args, 'summary') and args.summary else "Session ended"
+            cur.execute("""
+                INSERT INTO clambake.session_log
+                    (instance_id, project, action, summary)
+                VALUES (%s, %s, 'shutdown', %s)
+            """, (instance_id, project, summary))
+            cur.execute(
+                "DELETE FROM clambake.instances WHERE instance_id = %s",
+                (instance_id,)
+            )
+        conn.commit()
+        clear_instance_id()
+        print("CLAMBAKE DOWN: %s (%s)" % (instance_id, project))
+    finally:
+        conn.close()
+
+
+def cmd_infra(args):
+    """Show current infrastructure status."""
+    conn = get_conn_safe()
+    if not conn:
+        print("CLAMBAKE: Postgres unreachable. Cannot check infrastructure.")
+        return
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT * FROM clambake.current_infra")
+            rows = cur.fetchall()
+
+            print("=== INFRASTRUCTURE STATUS ===")
+            if not rows:
+                print("  (no services reported — use 'clambake infra-warn' to report)")
+                return
+            for r in rows:
+                status = r["status"].upper()
+                marker = "  " if r["status"] == "up" else "[!]"
+                port_str = ":%d" % r["port"] if r["port"] else ""
+                container_str = " (%s)" % r["container"] if r["container"] else ""
+                ttl = r["seconds_until_expiry"]
+                ttl_str = " [expires %dm]" % (ttl // 60) if ttl < 3600 else ""
+                msg = " — %s" % r["message"] if r["message"] else ""
+                print(" %s [%s] %s%s%s%s%s" % (
+                    marker, status, r["service"], port_str, container_str, ttl_str, msg))
+    finally:
+        conn.close()
+
+
+def cmd_infra_warn(args):
+    """Report infrastructure status (upserts by service name)."""
+    instance_id, _ = get_instance_id()
+    reported_by = instance_id or "human"
+
+    conn = get_conn_safe()
+    if not conn:
+        print("CLAMBAKE: Postgres unreachable.")
+        return
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO clambake.infra_state
+                    (service, status, port, container, message, reported_by)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (service) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    port = EXCLUDED.port,
+                    container = EXCLUDED.container,
+                    message = EXCLUDED.message,
+                    reported_by = EXCLUDED.reported_by,
+                    reported_at = NOW(),
+                    expires_at = NOW() + INTERVAL '4 hours'
+            """, (args.service, args.status, args.port, args.container, args.message, reported_by))
+        conn.commit()
+        print("INFRA: [%s] %s — %s" % (args.status.upper(), args.service, args.message or "updated"))
+    finally:
+        conn.close()
+
+
+def cmd_project_list(args):
+    """List all known projects with memory counts."""
+    conn = get_conn_safe()
+    if not conn:
+        print("CLAMBAKE: Postgres unreachable.")
+        return
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT project, COUNT(*) as memories,
+                       COUNT(*) FILTER (WHERE status = 'active') as active,
+                       MAX(updated_at) as last_updated
+                FROM clambake.project_memory
+                GROUP BY project
+                ORDER BY last_updated DESC
+            """)
+            rows = cur.fetchall()
+
+            print("=== PROJECTS ===")
+            if not rows:
+                print("  (no project memories stored)")
+                return
+            for r in rows:
+                ts = r["last_updated"].strftime("%Y-%m-%d") if r["last_updated"] else "?"
+                print("  %-25s %d memories (%d active)  updated %s" % (
+                    r["project"], r["memories"], r["active"], ts))
+
+            # Also show global memory count
+            cur.execute("SELECT COUNT(*) as cnt FROM clambake.global_memory")
+            gcnt = cur.fetchone()["cnt"]
+            print("\n  Global memories: %d" % gcnt)
     finally:
         conn.close()
 
@@ -927,7 +1976,17 @@ def main():
     sub.add_parser("disable", help="Disable Clambake (all commands become no-ops)")
     sub.add_parser("off", help="Disable Clambake (alias for disable)")
 
-    # register
+    # up (one-command startup)
+    p = sub.add_parser("up", help="One-command startup (register + inbox + recall + infra check)")
+    p.add_argument("--project", help="Project name (auto-detected from working dir if omitted)")
+    p.add_argument("--dir", help="Working directory (defaults to cwd)")
+    p.add_argument("--model", default="opus")
+
+    # down (one-command shutdown)
+    p = sub.add_parser("down", help="One-command shutdown (deregister + log)")
+    p.add_argument("--summary", help="Optional session summary to log")
+
+    # register (kept for backwards compat)
     p = sub.add_parser("register", help="Register this instance")
     p.add_argument("--project", required=True)
     p.add_argument("--dir")
@@ -973,6 +2032,8 @@ def main():
     p.add_argument("--global", dest="glob", action="store_true")
     p.add_argument("--type")
     p.add_argument("--search")
+    p.add_argument("--text-only", dest="text_only", action="store_true",
+                   help="Force text search (skip semantic)")
     p.add_argument("--limit", type=int, default=20)
 
     # update-memory
@@ -988,7 +2049,7 @@ def main():
     p.add_argument("--action", required=True,
                    choices=["started", "task_started", "task_completed",
                             "issue_found", "issue_resolved", "docker_operation",
-                            "file_modified", "shutdown"])
+                            "file_modified", "shutdown", "idle"])
     p.add_argument("--summary", required=True)
     p.add_argument("--files", help="Comma-separated modified files")
 
@@ -1040,15 +2101,75 @@ def main():
     p.add_argument("--description", required=True)
     p.add_argument("--prompt", required=True, help="System prompt for this role")
     p.add_argument("--capabilities", help="Comma-separated capabilities")
+    p.add_argument("--tool-allowlist", dest="tool_allowlist",
+                   help="Comma-separated tool allowlist (e.g. Read,Glob,Grep,Edit,Write,Bash)")
+    p.add_argument("--tool-denylist", dest="tool_denylist",
+                   help="Comma-separated tool denylist")
+
+    # role get-tools (for agent-worker.sh)
+    p = sub.add_parser("role-get-tools", help="Get tool allowlist for a role (shell-friendly)")
+    p.add_argument("name")
+    p.add_argument("--format", default="allowlist", choices=["allowlist", "json", "lines"])
 
     # role seed
-    sub.add_parser("role-seed", help="Seed default roles (planner, coder, qa, reviewer)")
+    sub.add_parser("role-seed", help="Seed default roles (8 roles with tool-gating)")
+
+    # --- Pipeline commands ---
+
+    # pipeline seed
+    sub.add_parser("pipeline-seed", help="Seed default pipeline templates")
+
+    # pipeline list
+    sub.add_parser("pipeline-list", help="List all pipeline templates")
+
+    # pipeline run
+    p = sub.add_parser("pipeline-run", help="Create chained tasks from a pipeline template")
+    p.add_argument("--pipeline", required=True, help="Template name (e.g. plan-build-review)")
+    p.add_argument("--project", required=True, help="Project name")
+    p.add_argument("--input", required=True, help="User's request / task description")
+    p.add_argument("--priority", type=int, default=0)
+
+    # pipeline status
+    p = sub.add_parser("pipeline-status", help="Show pipeline run progress")
+    p.add_argument("run_id", nargs="?", help="Specific run ID (omit for all recent runs)")
+
+    # pipeline prev-result (internal, for agent-worker.sh)
+    p = sub.add_parser("pipeline-prev-result", help="Get previous step's result (internal)")
+    p.add_argument("task_id", type=int)
+
+    # task get-meta (internal, for agent-worker.sh)
+    p = sub.add_parser("task-get-meta", help="Get single task field (internal)")
+    p.add_argument("task_id", type=int)
+    p.add_argument("--field", required=True, help="Field name to retrieve")
+
+    # digest
+    p = sub.add_parser("digest", help="Activity summary for last N hours")
+    p.add_argument("--hours", type=int, default=24)
+
+    # embed-backfill
+    sub.add_parser("embed-backfill", help="Generate embeddings for all memories missing them")
 
     # deregister
     sub.add_parser("deregister", help="Unregister this instance")
 
     # cleanup
     sub.add_parser("cleanup", help="Remove stale instances and expired messages")
+
+    # --- Infrastructure commands ---
+
+    # infra (view)
+    sub.add_parser("infra", help="Show live infrastructure status")
+
+    # infra-warn (report)
+    p = sub.add_parser("infra-warn", help="Report infrastructure status")
+    p.add_argument("--service", required=True, help="Service name (e.g. postgres, docker, ollama)")
+    p.add_argument("--status", required=True, choices=["up", "down", "degraded", "warning"])
+    p.add_argument("--message", help="Human-readable status message")
+    p.add_argument("--port", type=int, help="Primary port number")
+    p.add_argument("--container", help="Docker container name")
+
+    # project-list
+    sub.add_parser("project-list", help="List all known projects with memory counts")
 
     args = parser.parse_args()
 
@@ -1058,6 +2179,8 @@ def main():
         "on": cmd_enable,
         "disable": cmd_disable,
         "off": cmd_disable,
+        "up": cmd_up,
+        "down": cmd_down,
         "register": cmd_register,
         "heartbeat": cmd_heartbeat,
         "status": cmd_status,
@@ -1076,13 +2199,30 @@ def main():
         "role-list": cmd_role_list,
         "role-get": cmd_role_get,
         "role-create": cmd_role_create,
+        "role-get-tools": cmd_role_get_tools,
         "role-seed": cmd_role_seed,
+        "pipeline-seed": cmd_pipeline_seed,
+        "pipeline-list": cmd_pipeline_list,
+        "pipeline-run": cmd_pipeline_run,
+        "pipeline-status": cmd_pipeline_status,
+        "pipeline-prev-result": cmd_pipeline_prev_result,
+        "task-get-meta": cmd_task_get_meta,
+        "digest": cmd_digest,
+        "embed-backfill": cmd_embed_backfill,
+        "infra": cmd_infra,
+        "infra-warn": cmd_infra_warn,
+        "project-list": cmd_project_list,
         "deregister": cmd_deregister,
         "cleanup": cmd_cleanup,
     }
 
     # Commands that always run regardless of enabled state
     ALWAYS_RUN = {"init", "enable", "on", "disable", "off"}
+
+    # Graceful degradation: these commands use get_conn_safe() internally
+    # so they handle Postgres being down without crashing
+    GRACEFUL_COMMANDS = {"up", "down", "infra", "infra-warn", "project-list",
+                         "recall", "remember", "status", "digest"}
 
     # Gate check: if disabled, silently exit for non-essential commands
     if not CLAMBAKE_ENABLED and args.command not in ALWAYS_RUN:
@@ -1091,9 +2231,12 @@ def main():
     try:
         commands[args.command](args)
     except psycopg2.OperationalError as e:
-        print("DB ERROR: %s" % e)
-        print("Is Postgres running? (docker start swarm-postgres)")
-        sys.exit(1)
+        if args.command in GRACEFUL_COMMANDS:
+            print("CLAMBAKE: Postgres unreachable (localhost:%s). Skipping." % DB_PORT)
+        else:
+            print("DB ERROR: %s" % e)
+            print("Is Postgres running? (docker start postgres)")
+            sys.exit(1)
     except KeyboardInterrupt:
         pass
 
