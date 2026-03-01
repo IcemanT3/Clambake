@@ -2,11 +2,18 @@
 
 Exposes Clambake's project_memory and global_memory tables as MCP tools
 that Claude can call natively during conversations.
+
+Falls back to Clambake CLI if Postgres is unreachable.
 """
 
 import json
 from mcp.server.fastmcp import FastMCP
-from ..db import fetch, fetchrow, fetchval, execute
+from ..db import (
+    fetch, fetchrow, fetchval, execute,
+    DatabaseUnavailable, cli_recall, cli_remember,
+)
+
+DEGRADED_MSG = "[CLAMBAKE DEGRADED] Postgres is down — using CLI fallback. Results may be limited."
 
 
 def register_memory_tools(mcp: FastMCP):
@@ -37,31 +44,40 @@ def register_memory_tools(mcp: FastMCP):
         tag_list = tags or []
         file_list = related_files or []
 
-        if scope == "project":
-            if not project:
-                return "Error: project name is required for project-scoped memories."
-            row = await fetchrow(
-                """
-                INSERT INTO clambake.project_memory
-                    (project, memory_type, title, content, tags, related_files, created_by)
-                VALUES ($1, $2, $3, $4, $5, $6, 'mcp')
-                RETURNING id
-                """,
-                project, memory_type, title, content, tag_list, file_list,
-            )
-        else:
-            row = await fetchrow(
-                """
-                INSERT INTO clambake.global_memory
-                    (memory_type, title, content, tags, created_by)
-                VALUES ($1, $2, $3, $4, 'mcp')
-                RETURNING id
-                """,
-                memory_type, title, content, tag_list,
-            )
+        try:
+            if scope == "project":
+                if not project:
+                    return "Error: project name is required for project-scoped memories."
+                row = await fetchrow(
+                    """
+                    INSERT INTO clambake.project_memory
+                        (project, memory_type, title, content, tags, related_files, created_by)
+                    VALUES ($1, $2, $3, $4, $5, $6, 'mcp')
+                    RETURNING id
+                    """,
+                    project, memory_type, title, content, tag_list, file_list,
+                )
+            else:
+                row = await fetchrow(
+                    """
+                    INSERT INTO clambake.global_memory
+                        (memory_type, title, content, tags, created_by)
+                    VALUES ($1, $2, $3, $4, 'mcp')
+                    RETURNING id
+                    """,
+                    memory_type, title, content, tag_list,
+                )
+            mem_id = row["id"]
+            return f"Stored {scope} memory #{mem_id}: {title}"
 
-        mem_id = row["id"]
-        return f"Stored {scope} memory #{mem_id}: {title}"
+        except DatabaseUnavailable:
+            tag_str = ",".join(tag_list) if tag_list else ""
+            result = cli_remember(
+                project=project, memory_type=memory_type,
+                title=title, content=content,
+                is_global=(scope == "global"), tags=tag_str,
+            )
+            return f"{DEGRADED_MSG}\n{result}"
 
     @mcp.tool()
     async def memory_search(
@@ -84,72 +100,78 @@ def register_memory_tools(mcp: FastMCP):
             current_only: If true, only return active memories (default true).
             limit: Maximum results to return (default 10).
         """
-        results = []
-        search_pattern = f"%{query}%"
+        try:
+            results = []
+            search_pattern = f"%{query}%"
 
-        if scope in ("project", "all"):
-            sql = """
-                SELECT id, project, memory_type, title, content, status,
-                       tags, related_files, created_at, updated_at
-                FROM clambake.project_memory
-                WHERE (title ILIKE $1 OR content ILIKE $1)
-            """
-            params = [search_pattern]
-            idx = 2
+            if scope in ("project", "all"):
+                sql = """
+                    SELECT id, project, memory_type, title, content, status,
+                           tags, related_files, created_at, updated_at
+                    FROM clambake.project_memory
+                    WHERE (title ILIKE $1 OR content ILIKE $1)
+                """
+                params = [search_pattern]
+                idx = 2
 
-            if current_only:
-                sql += f" AND status = 'active'"
-            if project:
-                sql += f" AND project = ${idx}"
-                params.append(project)
-                idx += 1
-            if memory_type:
-                sql += f" AND memory_type = ${idx}"
-                params.append(memory_type)
-                idx += 1
-            if tags:
-                sql += f" AND tags && ${idx}"
-                params.append(tags)
-                idx += 1
+                if current_only:
+                    sql += " AND status = 'active'"
+                if project:
+                    sql += f" AND project = ${idx}"
+                    params.append(project)
+                    idx += 1
+                if memory_type:
+                    sql += f" AND memory_type = ${idx}"
+                    params.append(memory_type)
+                    idx += 1
+                if tags:
+                    sql += f" AND tags && ${idx}"
+                    params.append(tags)
+                    idx += 1
 
-            sql += f" ORDER BY updated_at DESC LIMIT ${idx}"
-            params.append(limit)
+                sql += f" ORDER BY updated_at DESC LIMIT ${idx}"
+                params.append(limit)
 
-            rows = await fetch(sql, *params)
-            for r in rows:
-                results.append(_format_memory(r, scope="project"))
+                rows = await fetch(sql, *params)
+                for r in rows:
+                    results.append(_format_memory(r, scope="project"))
 
-        if scope in ("global", "all"):
-            sql = """
-                SELECT id, memory_type, title, content,
-                       tags, created_at, updated_at
-                FROM clambake.global_memory
-                WHERE (title ILIKE $1 OR content ILIKE $1)
-            """
-            params = [search_pattern]
-            idx = 2
+            if scope in ("global", "all"):
+                sql = """
+                    SELECT id, memory_type, title, content,
+                           tags, created_at, updated_at
+                    FROM clambake.global_memory
+                    WHERE (title ILIKE $1 OR content ILIKE $1)
+                """
+                params = [search_pattern]
+                idx = 2
 
-            if memory_type:
-                sql += f" AND memory_type = ${idx}"
-                params.append(memory_type)
-                idx += 1
-            if tags:
-                sql += f" AND tags && ${idx}"
-                params.append(tags)
-                idx += 1
+                if memory_type:
+                    sql += f" AND memory_type = ${idx}"
+                    params.append(memory_type)
+                    idx += 1
+                if tags:
+                    sql += f" AND tags && ${idx}"
+                    params.append(tags)
+                    idx += 1
 
-            sql += f" ORDER BY updated_at DESC LIMIT ${idx}"
-            params.append(limit)
+                sql += f" ORDER BY updated_at DESC LIMIT ${idx}"
+                params.append(limit)
 
-            rows = await fetch(sql, *params)
-            for r in rows:
-                results.append(_format_memory(r, scope="global"))
+                rows = await fetch(sql, *params)
+                for r in rows:
+                    results.append(_format_memory(r, scope="global"))
 
-        if not results:
-            return f"No memories found matching '{query}'."
+            if not results:
+                return f"No memories found matching '{query}'."
 
-        header = f"Found {len(results)} memory(ies) matching '{query}':\n"
-        return header + "\n---\n".join(results)
+            header = f"Found {len(results)} memory(ies) matching '{query}':\n"
+            return header + "\n---\n".join(results)
+
+        except DatabaseUnavailable:
+            is_global = scope in ("global", "all")
+            result = cli_recall(project=project, search=query, is_global=is_global)
+            return f"{DEGRADED_MSG}\n{result}"
 
     @mcp.tool()
     async def memory_update(
@@ -172,43 +194,47 @@ def register_memory_tools(mcp: FastMCP):
             tags: New tags — replaces existing (optional).
             status: New status: active, resolved, deprecated, superseded (project only).
         """
-        table = "clambake.project_memory" if scope == "project" else "clambake.global_memory"
+        try:
+            table = "clambake.project_memory" if scope == "project" else "clambake.global_memory"
 
-        sets = ["updated_at = NOW()"]
-        params = []
-        idx = 1
+            sets = ["updated_at = NOW()"]
+            params = []
+            idx = 1
 
-        if content is not None:
-            sets.append(f"content = ${idx}")
-            params.append(content)
-            idx += 1
-        if title is not None:
-            sets.append(f"title = ${idx}")
-            params.append(title)
-            idx += 1
-        if memory_type is not None:
-            sets.append(f"memory_type = ${idx}")
-            params.append(memory_type)
-            idx += 1
-        if tags is not None:
-            sets.append(f"tags = ${idx}")
-            params.append(tags)
-            idx += 1
-        if status is not None and scope == "project":
-            sets.append(f"status = ${idx}")
-            params.append(status)
-            idx += 1
+            if content is not None:
+                sets.append(f"content = ${idx}")
+                params.append(content)
+                idx += 1
+            if title is not None:
+                sets.append(f"title = ${idx}")
+                params.append(title)
+                idx += 1
+            if memory_type is not None:
+                sets.append(f"memory_type = ${idx}")
+                params.append(memory_type)
+                idx += 1
+            if tags is not None:
+                sets.append(f"tags = ${idx}")
+                params.append(tags)
+                idx += 1
+            if status is not None and scope == "project":
+                sets.append(f"status = ${idx}")
+                params.append(status)
+                idx += 1
 
-        if len(sets) == 1:
-            return "Nothing to update — provide at least one field to change."
+            if len(sets) == 1:
+                return "Nothing to update — provide at least one field to change."
 
-        params.append(memory_id)
-        sql = f"UPDATE {table} SET {', '.join(sets)} WHERE id = ${idx} RETURNING id, title"
-        row = await fetchrow(sql, *params)
+            params.append(memory_id)
+            sql = f"UPDATE {table} SET {', '.join(sets)} WHERE id = ${idx} RETURNING id, title"
+            row = await fetchrow(sql, *params)
 
-        if not row:
-            return f"Memory #{memory_id} not found in {scope} scope."
-        return f"Updated {scope} memory #{row['id']}: {row['title']}"
+            if not row:
+                return f"Memory #{memory_id} not found in {scope} scope."
+            return f"Updated {scope} memory #{row['id']}: {row['title']}"
+
+        except DatabaseUnavailable:
+            return f"{DEGRADED_MSG}\nmemory_update requires direct database access. Use `clambake update-memory {memory_id}` from the terminal instead."
 
     @mcp.tool()
     async def memory_context(
@@ -228,60 +254,69 @@ def register_memory_tools(mcp: FastMCP):
             memory_type: Optional filter by type.
             limit: Max memories to return (default 15, be mindful of context budget).
         """
-        results = []
+        try:
+            results = []
 
-        if scope in ("project", "all"):
-            sql = """
-                SELECT id, project, memory_type, title, content, status,
-                       tags, related_files, created_at, updated_at
-                FROM clambake.project_memory
-                WHERE status = 'active'
-            """
-            params = []
-            idx = 1
+            if scope in ("project", "all"):
+                sql = """
+                    SELECT id, project, memory_type, title, content, status,
+                           tags, related_files, created_at, updated_at
+                    FROM clambake.project_memory
+                    WHERE status = 'active'
+                """
+                params = []
+                idx = 1
 
-            if project:
-                sql += f" AND project = ${idx}"
-                params.append(project)
-                idx += 1
-            if memory_type:
-                sql += f" AND memory_type = ${idx}"
-                params.append(memory_type)
-                idx += 1
+                if project:
+                    sql += f" AND project = ${idx}"
+                    params.append(project)
+                    idx += 1
+                if memory_type:
+                    sql += f" AND memory_type = ${idx}"
+                    params.append(memory_type)
+                    idx += 1
 
-            sql += f" ORDER BY updated_at DESC LIMIT ${idx}"
-            params.append(limit)
+                sql += f" ORDER BY updated_at DESC LIMIT ${idx}"
+                params.append(limit)
 
-            rows = await fetch(sql, *params)
-            for r in rows:
-                results.append(_format_memory(r, scope="project"))
+                rows = await fetch(sql, *params)
+                for r in rows:
+                    results.append(_format_memory(r, scope="project"))
 
-        if scope in ("global", "all"):
-            sql = """
-                SELECT id, memory_type, title, content,
-                       tags, created_at, updated_at
-                FROM clambake.global_memory
-            """
-            params = []
-            idx = 1
+            if scope in ("global", "all"):
+                sql = """
+                    SELECT id, memory_type, title, content,
+                           tags, created_at, updated_at
+                    FROM clambake.global_memory
+                """
+                params = []
+                idx = 1
 
-            if memory_type:
-                sql += f" WHERE memory_type = ${idx}"
-                params.append(memory_type)
-                idx += 1
+                if memory_type:
+                    sql += f" WHERE memory_type = ${idx}"
+                    params.append(memory_type)
+                    idx += 1
 
-            sql += f" ORDER BY updated_at DESC LIMIT ${idx}"
-            params.append(limit)
+                sql += f" ORDER BY updated_at DESC LIMIT ${idx}"
+                params.append(limit)
 
-            rows = await fetch(sql, *params)
-            for r in rows:
-                results.append(_format_memory(r, scope="global"))
+                rows = await fetch(sql, *params)
+                for r in rows:
+                    results.append(_format_memory(r, scope="global"))
 
-        if not results:
-            return "No memories found for this context."
+            if not results:
+                return "No memories found for this context."
 
-        header = f"Context loaded: {len(results)} memory(ies)\n"
-        return header + "\n---\n".join(results)
+            header = f"Context loaded: {len(results)} memory(ies)\n"
+            return header + "\n---\n".join(results)
+
+        except DatabaseUnavailable:
+            lines = [DEGRADED_MSG]
+            if scope in ("global", "all"):
+                lines.append(cli_recall(is_global=True))
+            if scope in ("project", "all") and project:
+                lines.append(cli_recall(project=project))
+            return "\n".join(lines)
 
     @mcp.tool()
     async def memory_delete(
@@ -294,13 +329,17 @@ def register_memory_tools(mcp: FastMCP):
             memory_id: The memory ID to delete.
             scope: "project" or "global".
         """
-        table = "clambake.project_memory" if scope == "project" else "clambake.global_memory"
-        row = await fetchrow(
-            f"DELETE FROM {table} WHERE id = $1 RETURNING id, title", memory_id
-        )
-        if not row:
-            return f"Memory #{memory_id} not found in {scope} scope."
-        return f"Deleted {scope} memory #{row['id']}: {row['title']}"
+        try:
+            table = "clambake.project_memory" if scope == "project" else "clambake.global_memory"
+            row = await fetchrow(
+                f"DELETE FROM {table} WHERE id = $1 RETURNING id, title", memory_id
+            )
+            if not row:
+                return f"Memory #{memory_id} not found in {scope} scope."
+            return f"Deleted {scope} memory #{row['id']}: {row['title']}"
+
+        except DatabaseUnavailable:
+            return f"{DEGRADED_MSG}\nmemory_delete requires direct database access. Not available in degraded mode."
 
     @mcp.tool()
     async def memory_checkpoint(
@@ -338,6 +377,7 @@ def register_memory_tools(mcp: FastMCP):
 
         saved = []
         errors = []
+        degraded = False
 
         for i, mem in enumerate(memories):
             title = mem.get("title", "").strip()
@@ -377,10 +417,24 @@ def register_memory_tools(mcp: FastMCP):
                         memory_type, title, content, tag_list,
                     )
                 saved.append(f"#{row['id']} [{scope}] {title}")
+
+            except DatabaseUnavailable:
+                degraded = True
+                tag_str = ",".join(tag_list) if tag_list else ""
+                result = cli_remember(
+                    project=project, memory_type=memory_type,
+                    title=title, content=content,
+                    is_global=(scope == "global"), tags=tag_str,
+                )
+                saved.append(f"[cli] [{scope}] {title} — {result}")
+
             except Exception as e:
                 errors.append(f"[{i}] '{title}' — {str(e)}")
 
-        lines = [f"Checkpoint complete: {len(saved)} saved, {len(errors)} skipped."]
+        lines = []
+        if degraded:
+            lines.append(DEGRADED_MSG)
+        lines.append(f"Checkpoint complete: {len(saved)} saved, {len(errors)} skipped.")
         if saved:
             lines.append("\nSaved:")
             for s in saved:
