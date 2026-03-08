@@ -22,6 +22,19 @@ clambake down
 
 `clambake up` auto-detects the project from your working directory, registers the instance, checks inbox, loads project + global memories, and shows infrastructure warnings. If Postgres is unreachable, it prints a warning and exits cleanly.
 
+## Doc Compliance (MANDATORY)
+Every project MUST have three standard docs. If you built or modified a project, ensure these exist before ending your session:
+
+| Doc | Purpose | Format |
+|-----|---------|--------|
+| **CLAUDE.md** | Architecture, tech stack, Docker setup, gotchas, related projects | Prose + tables |
+| **BUILD.md** | Tech stack matrix, key files, database schema, CLI commands | Tables + code blocks |
+| **ISSUES.md** | Numbered issues with problem/fix/status | `### PROJ-N: Title` sections |
+
+**New project?** Create all three.
+**Modified existing project?** Update the relevant docs to reflect your changes.
+**Store a memory:** `clambake remember --project <name> --type <type> --title "..." --content "..."`
+
 ## Quick Reference
 
 | Command | Purpose |

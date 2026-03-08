@@ -28,6 +28,9 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+import subprocess
+import time
+
 import psycopg2
 import psycopg2.extras
 import requests
@@ -98,12 +101,74 @@ def get_conn():
     )
 
 
+def _docker_ready():
+    """Check if Docker daemon is responding."""
+    try:
+        result = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=10
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _try_start_postgres():
+    """Attempt to start Docker and the Postgres container. Returns True if started."""
+    try:
+        if not _docker_ready():
+            # Docker not running — start backend without GUI
+            subprocess.Popen(
+                [r"C:\Program Files\Docker\Docker\resources\com.docker.backend.exe",
+                 "-with-frontend=false"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            # Wait for Docker daemon (up to 60s — cold start can be slow)
+            for _ in range(20):
+                time.sleep(3)
+                if _docker_ready():
+                    break
+            else:
+                return False
+
+        # Docker is running — start Postgres container (retry if engine not fully ready)
+        for _ in range(3):
+            result = subprocess.run(
+                ["docker", "start", "postgres"], capture_output=True, timeout=15
+            )
+            if result.returncode == 0:
+                break
+            time.sleep(3)
+        else:
+            return False
+
+        # Wait for Postgres to accept connections (up to 30s)
+        for _ in range(15):
+            time.sleep(2)
+            try:
+                conn = get_conn()
+                conn.close()
+                return True
+            except (psycopg2.OperationalError, psycopg2.Error):
+                continue
+        return False
+    except Exception:
+        return False
+
+
 def get_conn_safe():
-    """Get a database connection, or None if Postgres is unreachable."""
+    """Get a database connection. Auto-starts Docker/Postgres if needed."""
     try:
         return get_conn()
     except (psycopg2.OperationalError, psycopg2.Error):
-        return None
+        pass
+
+    # Postgres unreachable — try to start it
+    if _try_start_postgres():
+        try:
+            return get_conn()
+        except (psycopg2.OperationalError, psycopg2.Error):
+            return None
+    return None
 
 
 def get_instance_id():
@@ -114,12 +179,12 @@ def get_instance_id():
     return None, None
 
 
-def save_instance_id(instance_id, project):
+def save_instance_id(instance_id, project, role=None):
     """Save instance ID to file."""
-    INSTANCE_FILE.write_text(json.dumps({
-        "instance_id": instance_id,
-        "project": project
-    }))
+    data = {"instance_id": instance_id, "project": project}
+    if role:
+        data["role"] = role
+    INSTANCE_FILE.write_text(json.dumps(data))
 
 
 def clear_instance_id():
@@ -175,6 +240,7 @@ def cmd_register(args):
     project = args.project
     working_dir = args.dir or os.getcwd()
     model = args.model or "unknown"
+    role = getattr(args, "role", None) or os.environ.get("CLAMBAKE_ROLE")
 
     conn = get_conn()
     try:
@@ -195,19 +261,20 @@ def cmd_register(args):
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO clambake.instances
-                    (instance_id, project, working_dir, model, status)
-                VALUES (%s, %s, %s, %s, 'active')
+                    (instance_id, project, working_dir, model, role, status)
+                VALUES (%s, %s, %s, %s, %s, 'active')
                 ON CONFLICT (instance_id) DO UPDATE SET
-                    last_heartbeat = NOW(), status = 'active'
-            """, (instance_id, project, working_dir, model))
+                    last_heartbeat = NOW(), status = 'active', role = EXCLUDED.role
+            """, (instance_id, project, working_dir, model, role))
         conn.commit()
-        save_instance_id(instance_id, project)
-        print("REGISTERED: %s on project '%s'" % (instance_id, project))
+        save_instance_id(instance_id, project, role)
+        role_tag = " <%s>" % role if role else ""
+        print("REGISTERED: %s%s on project '%s'" % (instance_id, role_tag, project))
 
         # Check for other active instances and unread messages
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT instance_id, project, current_task, status
+                SELECT instance_id, project, current_task, role, status
                 FROM clambake.active_instances
                 WHERE instance_id != %s
             """, (instance_id,))
@@ -216,8 +283,9 @@ def cmd_register(args):
                 print("\nACTIVE INSTANCES:")
                 for o in others:
                     task = o["current_task"] or "idle"
-                    print("  [%s] %s — %s (%s)" % (
-                        o["status"], o["project"], task, o["instance_id"]))
+                    role_tag = " <%s>" % o["role"] if o.get("role") else ""
+                    print("  [%s]%s %s — %s (%s)" % (
+                        o["status"], role_tag, o["project"], task, o["instance_id"]))
 
             # Check for messages to this project or @all
             cur.execute("""
@@ -266,11 +334,13 @@ def cmd_register(args):
 
 
 def cmd_heartbeat(args):
-    """Update heartbeat and optionally current task/status."""
+    """Update heartbeat and optionally current task/status/role."""
     instance_id, project = get_instance_id()
     if not instance_id:
         print("ERROR: Not registered. Run 'clambake register' first.")
         sys.exit(1)
+
+    role = getattr(args, "role", None) or os.environ.get("CLAMBAKE_ROLE")
 
     conn = get_conn()
     try:
@@ -283,6 +353,9 @@ def cmd_heartbeat(args):
             if args.status:
                 updates.append("status = %s")
                 params.append(args.status)
+            if role:
+                updates.append("role = %s")
+                params.append(role)
             params.append(instance_id)
 
             cur.execute(
@@ -291,7 +364,8 @@ def cmd_heartbeat(args):
             )
         conn.commit()
         task_msg = " task='%s'" % args.task if args.task else ""
-        print("HEARTBEAT: %s%s" % (instance_id, task_msg))
+        role_msg = " role=%s" % role if role else ""
+        print("HEARTBEAT: %s%s%s" % (instance_id, role_msg, task_msg))
     finally:
         conn.close()
 
@@ -311,8 +385,10 @@ def cmd_status(args):
             for i in instances:
                 task = i["current_task"] or "idle"
                 age = i["seconds_since_heartbeat"]
-                print("  [%s] %s — %s (heartbeat %ds ago) %s" % (
-                    i["status"], i["project"], task, age, i["instance_id"]))
+                role_tag = " <%s>" % i["role"] if i.get("role") else ""
+                age_str = "%ds ago" % age if age < 60 else "%dm ago" % (age // 60)
+                print("  [%s]%s %s — %s (%s) %s" % (
+                    i["status"], role_tag, i["project"], task, age_str, i["instance_id"]))
 
             # Recent messages (last 24h)
             cur.execute("""
@@ -1717,6 +1793,7 @@ def cmd_up(args):
         project = args.project or detect_project(working_dir)
         instance_id = str(uuid.uuid4())[:12]
         model = args.model or "opus"
+        role = getattr(args, "role", None) or os.environ.get("CLAMBAKE_ROLE")
 
         # Auto-cleanup stale data
         counts = _run_cleanup(conn)
@@ -1726,23 +1803,24 @@ def cmd_up(args):
             # Register
             cur.execute("""
                 INSERT INTO clambake.instances
-                    (instance_id, project, working_dir, model, status)
-                VALUES (%s, %s, %s, %s, 'active')
+                    (instance_id, project, working_dir, model, role, status)
+                VALUES (%s, %s, %s, %s, %s, 'active')
                 ON CONFLICT (instance_id) DO UPDATE SET
-                    last_heartbeat = NOW(), status = 'active'
-            """, (instance_id, project, working_dir, model))
+                    last_heartbeat = NOW(), status = 'active', role = EXCLUDED.role
+            """, (instance_id, project, working_dir, model, role))
         conn.commit()
-        save_instance_id(instance_id, project)
+        save_instance_id(instance_id, project, role)
 
+        role_tag = " <%s>" % role if role else ""
         print("=== CLAMBAKE UP ===")
-        print("  Instance: %s | Project: %s" % (instance_id, project))
+        print("  Instance: %s%s | Project: %s" % (instance_id, role_tag, project))
         if cleaned > 0:
             print("  Auto-cleaned %d stale entries" % cleaned)
 
         # Other active instances
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT instance_id, project, current_task, status
+                SELECT instance_id, project, current_task, role, status
                 FROM clambake.active_instances
                 WHERE instance_id != %s
             """, (instance_id,))
@@ -1751,8 +1829,9 @@ def cmd_up(args):
                 print("\n--- Active Instances ---")
                 for o in others:
                     task = o["current_task"] or "idle"
-                    print("  [%s] %s — %s (%s)" % (
-                        o["status"], o["project"], task, o["instance_id"]))
+                    role_tag = " <%s>" % o["role"] if o.get("role") else ""
+                    print("  [%s]%s %s — %s (%s)" % (
+                        o["status"], role_tag, o["project"], task, o["instance_id"]))
 
             # Unread messages
             cur.execute("""
@@ -1981,6 +2060,8 @@ def main():
     p.add_argument("--project", help="Project name (auto-detected from working dir if omitted)")
     p.add_argument("--dir", help="Working directory (defaults to cwd)")
     p.add_argument("--model", default="opus")
+    p.add_argument("--role", choices=["boss", "worker", "human"],
+                   help="Instance role (falls back to CLAMBAKE_ROLE env var)")
 
     # down (one-command shutdown)
     p = sub.add_parser("down", help="One-command shutdown (deregister + log)")
@@ -1991,11 +2072,15 @@ def main():
     p.add_argument("--project", required=True)
     p.add_argument("--dir")
     p.add_argument("--model", default="opus")
+    p.add_argument("--role", choices=["boss", "worker", "human"],
+                   help="Instance role (falls back to CLAMBAKE_ROLE env var)")
 
     # heartbeat
     p = sub.add_parser("heartbeat", help="Update heartbeat")
     p.add_argument("--task")
     p.add_argument("--status", choices=["active", "idle", "busy", "shutting_down"])
+    p.add_argument("--role", choices=["boss", "worker", "human"],
+                   help="Update instance role (falls back to CLAMBAKE_ROLE env var)")
 
     # status
     sub.add_parser("status", help="Show all active instances")

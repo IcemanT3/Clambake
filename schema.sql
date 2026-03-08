@@ -14,11 +14,17 @@ CREATE TABLE IF NOT EXISTS clambake.instances (
     working_dir     TEXT,                        -- e.g. 'F:/Docker/doc-db-v2'
     current_task    TEXT,                        -- free-text: what they're doing right now
     model           TEXT,                        -- e.g. 'opus', 'sonnet'
+    role            TEXT                         -- boss, worker, human, or NULL
+                    CHECK (role IS NULL OR role IN ('boss', 'worker', 'human')),
     status          TEXT NOT NULL DEFAULT 'active'
                     CHECK (status IN ('active', 'idle', 'busy', 'shutting_down')),
     started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_heartbeat  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Add role column (for existing databases)
+ALTER TABLE clambake.instances ADD COLUMN IF NOT EXISTS role TEXT
+    CHECK (role IS NULL OR role IN ('boss', 'worker', 'human'));
 
 -- Auto-expire stale instances (no heartbeat in 30 min)
 CREATE INDEX IF NOT EXISTS idx_instances_heartbeat
@@ -160,8 +166,9 @@ CREATE INDEX IF NOT EXISTS idx_session_log_instance
 -- ============================================================
 
 -- Active instances (heartbeat within last 30 minutes)
+DROP VIEW IF EXISTS clambake.active_instances;
 CREATE OR REPLACE VIEW clambake.active_instances AS
-SELECT instance_id, project, working_dir, current_task, model, status,
+SELECT instance_id, project, working_dir, current_task, model, role, status,
        started_at, last_heartbeat,
        EXTRACT(EPOCH FROM (NOW() - last_heartbeat))::int AS seconds_since_heartbeat
 FROM clambake.instances
