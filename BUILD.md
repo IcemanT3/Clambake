@@ -6,29 +6,32 @@
 | Language | Python 3.8+ |
 | Database | PostgreSQL 15 + pgvector (schema: `clambake` in `docdb`) |
 | Embeddings | Ollama `nomic-embed-text` (768-dim, optional) |
-| Container | Ubuntu 24.04 + Claude Code CLI + tmux |
-| Notifications | Microsoft Teams Bot (optional, `teams` profile) |
-| Tunnel | Cloudflare Tunnel (optional, `teams` profile) |
+| MCP Server | FastMCP (stdio transport) for native Claude Code integration |
+| Agent Roles | `.claude/commands/*.md` (Claude Code custom commands) |
 | Python deps | `psycopg2-binary`, `requests` |
+| MCP deps | `mcp[cli]`, `asyncpg` |
 
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `clambake.py` | CLI -- all commands (session, memory, tasks, pipelines, roles) |
+| `clambake.py` | CLI -- memory, infra, messaging, session lifecycle |
 | `schema.sql` | Database DDL for all tables and views |
-| `agent-worker.sh` | Agent loop: claim task -> build --allowedTools -> run Claude -> mark done |
-| `launch-tmux.sh` | Creates tmux session with dashboard + one window per agent role |
-| `spawn-claude.sh` | Launches a single Claude Code instance with role-gated tools |
-| `launch-agents.sh` | Alternative agent launcher |
-| `start.cmd` | Windows menu launcher (planner, coders, full pipeline, etc.) |
-| `kill-workers.sh` | Stops all running agent workers |
-| `migrate_markdown.py` | One-time migration from markdown MEMORY.md files to Postgres |
-| `docker-compose.yml` | Orchestrator container + Teams bot + Cloudflare tunnel |
-| `Dockerfile` | Ubuntu 24.04 + Claude Code + tmux + non-root user |
+| `mcp_server/server.py` | MCP server entry point |
+| `mcp_server/tools/memory.py` | MCP memory tools (store, search, update, delete, checkpoint) |
+| `mcp_server/tools/projects.py` | MCP project listing tools |
+| `mcp_server/db.py` | Async Postgres connection pool + CLI fallback |
+| `.claude/commands/architect.md` | Architect agent role (design, specs) |
+| `.claude/commands/backend.md` | Backend engineer role (Python, SQL, APIs) |
+| `.claude/commands/frontend.md` | Frontend engineer role (React, HTML/CSS) |
+| `.claude/commands/devops.md` | DevOps role (Docker, Traefik, infra) |
+| `.claude/commands/qa.md` | QA/Validator role (testing, review) |
+| `ROADMAP.md` | Architecture vision and future plans |
+| `backup-pre-pivot/` | Pre-pivot code backup (orchestration, pipelines, agent workers) |
 
 ## Database
 Schema: `clambake` in database `docdb` on `localhost:5433`
 
+### Active Tables
 | Table | Purpose |
 |-------|---------|
 | `instances` | Active Claude Code sessions (heartbeat, project, status) |
@@ -36,47 +39,51 @@ Schema: `clambake` in database `docdb` on `localhost:5433`
 | `project_memory` | Per-project knowledge with pgvector embeddings |
 | `global_memory` | Cross-project knowledge with pgvector embeddings |
 | `infra_state` | Live service status (expire 4h) |
-| `tasks` | Multi-agent task dispatch with dependencies and pipeline tracking |
-| `agent_roles` | 8 default roles with tool allowlists/denylists |
-| `pipeline_templates` | 5 reusable multi-agent workflow definitions |
 | `session_log` | Audit trail (cleaned after 90 days) |
 
-Key views: `active_instances`, `unread_messages`, `recent_activity`, `available_tasks`, `current_infra`, `pipeline_runs`
+### Legacy Tables (retained for backward compat, to be dropped)
+| Table | Purpose |
+|-------|---------|
+| `tasks` | Multi-agent task dispatch (replaced by Agent Teams) |
+| `agent_roles` | Role definitions (replaced by .claude/commands/) |
+| `pipeline_templates` | Workflow definitions (replaced by Agent Teams) |
 
-## Docker
-- **Orchestrator**: Custom build from Dockerfile (Ubuntu 24.04 + Claude Code + tmux)
-  - Container: `clambake-orchestrator`
-  - No exposed ports (CLI-only, connects to host Postgres)
-  - Volumes: `F:/Docker/clambake:/opt/clambake` (live code), `F:/Claude App/Mind Meld:/workspace`
-- **Teams Bot** (optional, `teams` profile): Port 3978, container `clambake-teams-bot`
-- **Cloudflare Tunnel** (optional, `teams` profile): `cloudflare/cloudflared:latest`, container `clambake-cloudflared`
+Key views: `active_instances`, `unread_messages`, `recent_activity`, `current_infra`
 
 ## Commands
 ```bash
-# Host CLI (any Git Bash session)
+# Session lifecycle
 clambake up                          # Start session
 clambake down                        # End session
-clambake status                      # Active instances
-clambake recall --project X          # Query memory
-clambake remember --project X ...    # Store memory
+clambake checkin                     # Lightweight heartbeat (used by hooks)
+clambake status                      # Active instances + messages
 
-# Docker orchestrator
-cd F:/Docker/clambake
-docker compose up -d --build         # Build orchestrator
-docker compose --profile teams up -d # With Teams bot
+# Memory
+clambake remember --project X --type T --title "..." --content "..."
+clambake recall --project X [--search "query"]
+clambake recall --global [--search "query"]
+clambake update-memory ID [--content "..."] [--status S]
+clambake embed-backfill              # Generate missing embeddings
 
-# Launch agents in tmux
-MSYS_NO_PATHCONV=1 docker exec -it clambake-orchestrator \
-  bash /opt/clambake/launch-tmux.sh <project> [roles...]
+# Messaging
+clambake send --to @all --type warning --subject "..."
+clambake inbox
 
-# Windows launcher
-start.cmd
+# Infrastructure
+clambake infra                       # View status
+clambake infra-warn --service X --status S --message "..."
+
+# Agent roles (slash commands)
+/architect <task description>
+/backend <task description>
+/frontend <task description>
+/devops <task description>
+/qa <task description>
 ```
 
 ## Environment Variables
 | Variable | Purpose |
 |----------|---------|
-| `ANTHROPIC_API_KEY` | Claude API key for agents |
 | `CLAMBAKE_DB_HOST` | Postgres host (default: `localhost`) |
 | `CLAMBAKE_DB_PORT` | Postgres port (default: `5433`) |
 | `CLAMBAKE_DB_NAME` | Database name (default: `docdb`) |
@@ -84,9 +91,10 @@ start.cmd
 | `CLAMBAKE_DB_PASS` | Database password (default: `postgres`) |
 | `OLLAMA_BASE_URL` | Ollama endpoint (default: `http://localhost:11434`) |
 | `CLAMBAKE_EMBEDDING_MODEL` | Embedding model (default: `nomic-embed-text`) |
-| `TEAMS_BOT_APP_ID` | Teams bot app ID (optional) |
-| `TEAMS_BOT_APP_PASSWORD` | Teams bot password (optional) |
-| `CLOUDFLARE_TUNNEL_TOKEN` | Cloudflare tunnel token (optional) |
 
-## Architecture Notes
-Clambake is a peer-to-peer coordination system with no central orchestrator process. All Claude Code instances communicate through a shared Postgres database. The CLI (`clambake.py`) handles session lifecycle, memory storage/retrieval with semantic search (pgvector), inter-instance messaging, infrastructure monitoring, and multi-agent task dispatch with role-based tool gating. Agents run inside a Docker container with tmux, each in a loop that claims tasks matching their role, launches Claude Code with enforced tool restrictions, and captures output for pipeline handoff.
+## Architecture
+Clambake is a peer-to-peer coordination system. All Claude Code instances communicate
+through a shared Postgres database. The CLI handles session lifecycle, memory with
+semantic search (pgvector), messaging, and infrastructure monitoring. Orchestration
+(agent spawning, task dispatch, dependencies) is handled by Claude Code's native
+Agent Teams system. Agent roles are defined as `.claude/commands/*.md` custom commands.
