@@ -1,13 +1,17 @@
-# Clambake — Multi-Instance Coordination
+# Clambake — Memory, Infrastructure & Audit Layer
 
 ## What This Is
-Clambake coordinates multiple Claude Code instances through a shared Postgres database. It handles instance registration, inter-instance messaging, persistent project/global memory with semantic search, infrastructure status tracking, and multi-agent task dispatch.
+Clambake is a thin layer that adds persistent memory (Postgres + pgvector), infrastructure
+awareness, inter-instance messaging, and session audit trails to Claude Code. It does NOT
+handle orchestration — Claude Code's native Agent Teams handles spawning, communication,
+and dependency resolution.
 
 ## Setup
 - **CLI**: `python F:/Docker/clambake/clambake.py <command>`
 - **Database**: `docdb` on `localhost:5433`, schema: `clambake`
 - **Requires**: `psycopg2-binary`, `requests` (pip install)
 - **Embeddings**: Ollama `nomic-embed-text` at `localhost:11434` (optional, for semantic search)
+- **MCP Server**: Exposes memory tools natively to Claude Code conversations
 - **Enabled by default** — degrades gracefully if Postgres is down
 
 ## Session Protocol
@@ -20,7 +24,21 @@ clambake up
 clambake down
 ```
 
-`clambake up` auto-detects the project from your working directory, registers the instance, checks inbox, loads project + global memories, and shows infrastructure warnings. If Postgres is unreachable, it prints a warning and exits cleanly.
+`clambake up` auto-detects the project from your working directory, registers the instance,
+checks inbox, loads project + global memories, and shows infrastructure warnings.
+
+## Agent Roles
+Agent roles are defined as `.claude/commands/*.md` files, invokable as slash commands:
+
+| Command | Role | Does |
+|---------|------|------|
+| `/architect` | Architect | Design, specs, architecture decisions (read-only) |
+| `/backend` | Backend Engineer | Python, SQL, APIs, business logic |
+| `/frontend` | Frontend Engineer | React, HTML/CSS, client-side JS |
+| `/devops` | DevOps | Docker, Traefik, infrastructure |
+| `/qa` | QA/Validator | Testing, code review, bug reporting |
+
+Usage: `/architect Design the new search API for Doc DB`
 
 ## Quick Reference
 
@@ -46,21 +64,17 @@ clambake down
 **Project**: architecture, feature, issue, fix, decision, pattern, gotcha, update
 **Global**: infrastructure, convention, tool, preference, credential, lesson
 
-## Before Risky Operations
-```bash
-clambake send --to @all --type warning --subject "Restarting Docker" --body "Details"
-# ... do the work ...
-clambake send --to @all --type done --subject "Docker restart complete"
-```
+## Doc Compliance (MANDATORY)
+Every project MUST have three standard docs:
 
-## Multi-Agent Task Dispatch
-```bash
-clambake role-seed                          # Create default roles
-clambake task-create --project X --title "..." --role coder --description "..."
-clambake task-list --available --role coder  # See claimable tasks
-clambake task-claim 5                       # Claim a task
-clambake task-done 5 --result "summary"     # Mark complete
-```
+| Doc | Purpose | Format |
+|-----|---------|--------|
+| **CLAUDE.md** | Architecture, tech stack, Docker setup, gotchas | Prose + tables |
+| **BUILD.md** | Tech stack matrix, key files, database schema | Tables + code blocks |
+| **ISSUES.md** | Numbered issues with problem/fix/status | `### PROJ-N: Title` sections |
 
-## Full Documentation
-See [README.md](README.md) for the complete technical manual.
+## Architecture History
+Clambake was originally a full orchestration framework with task dispatch, role management,
+and pipeline templates. On 2026-03-12, orchestration was removed in favor of Claude Code's
+native Agent Teams. The removed code is in `backup-pre-pivot/`. See `ROADMAP.md` for the
+full migration plan and future work.
